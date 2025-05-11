@@ -21,14 +21,6 @@ let local_token_cache = {
     timestamp: 0,
 };
 
-function transformModeusIdToGoogleId(modeusEventId) {
-    if (!modeusEventId || typeof modeusEventId !== "string") {
-        Logger.warnMessage(`Invalid Modeus Event ID for transformation: ${modeusEventId}`);
-        return null;
-    }
-    return modeusEventId.replace(/-/g, "").toLowerCase();
-}
-
 let year = (d) => {
     return ("0000" + d.getUTCFullYear()).slice(-4);
 };
@@ -54,7 +46,7 @@ function getDates() {
     let diff = (timestamp - first_monday) % (7 * 24 * 60 * 60 * 1000);
 
     let start_timestamp = timestamp - diff - 5 * 60 * 60 * 1000;
-    let end_timestamp = start_timestamp + 2 * 7 * 24 * 60 * 60 * 1000;
+    let end_timestamp = start_timestamp + 3 * 7 * 24 * 60 * 60 * 1000;
 
     let sd = new Date(start_timestamp);
     let ed = new Date(end_timestamp);
@@ -453,7 +445,6 @@ async function callGoogleApiWithRetry(apiCallFunction, logContext = "", maxRetri
         try {
             return await apiCallFunction();
         } catch (error) {
-            console.log(error);
             const statusCode = error.code;
             const detailedErrors = error.errors;
 
@@ -491,7 +482,7 @@ async function callGoogleApiWithRetry(apiCallFunction, logContext = "", maxRetri
                 const finalError = new Error(`Final error for ${logContext}: ${errorMessage}`);
                 finalError.code = statusCode;
                 finalError.originalError = error;
-                throw finalError; // Throw after logging
+                throw finalError;
             }
         }
     }
@@ -590,6 +581,8 @@ async function recheckModeus() {
     let rd = new Date(google_sync_start_time * 1000 + 5 * 60 * 60 * 1000);
     let refresh_display = `${day(rd)}.${month(rd)}.${year(rd)} ${hour(rd)}:${minute(rd)}:${second(rd)}`;
 
+    let modeusEventDetailsCache = new Map();
+
     for await (const gcal_user of logged_google_users) {
         let user_modeus_id = gcal_user.attendee_id;
         Logger.infoMessage(`Starting Google Calendar sync for user ${user_modeus_id}`);
@@ -660,113 +653,149 @@ async function recheckModeus() {
                 continue;
             }
 
+            let modeusIdToActiveGoogleIdMap = new Map();
             let batchGetRequests = [];
-            let modeusEventDetailsCache = new Map();
+            let googleIdToModeusIdForGet = new Map();
 
             for (const user_event_link of modeus_events_for_this_user) {
                 const modeus_event_id = user_event_link.event_id;
-                const googleCompatibleEventId = transformModeusIdToGoogleId(modeus_event_id);
-                if (!googleCompatibleEventId) continue;
+                const unique_event_modeus_id = `${modeus_event_id}-${user_modeus_id}`;
+                const dbCalendarEntries = await db.findCalendarEvent(unique_event_modeus_id);
 
-                if (!modeusEventDetailsCache.has(modeus_event_id)) {
-                    let event_detail_records = await db.getEvent(modeus_event_id);
-                    if (event_detail_records[0].event_data) {
-                        modeusEventDetailsCache.set(modeus_event_id, JSON.parse(event_detail_records[0].event_data));
-                    } else {
-                        Logger.warnMessage(
-                            `Missing or invalid full details for Modeus event ${modeus_event_id}. Cannot sync.`
-                        );
-                        continue;
-                    }
+                if (dbCalendarEntries?.[0]?.calendar_id) {
+                    const google_id_from_db = dbCalendarEntries[0].calendar_id;
+                    modeusIdToActiveGoogleIdMap.set(modeus_event_id, google_id_from_db);
+                    googleIdToModeusIdForGet.set(google_id_from_db, modeus_event_id);
+                    batchGetRequests.push({
+                        method: "GET",
+                        endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${google_id_from_db}`,
+                        customOperationId: google_id_from_db,
+                    });
                 }
-
-                batchGetRequests.push({
-                    method: "GET",
-                    endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${googleCompatibleEventId}`,
-                    customOperationId: modeus_event_id,
-                });
             }
 
-            let existingGoogleEventsMap = new Map();
             if (batchGetRequests.length > 0) {
                 const getChunks = [];
                 for (let i = 0; i < batchGetRequests.length; i += GOOGLE_API_BATCH_LIMIT) {
                     getChunks.push(batchGetRequests.slice(i, i + GOOGLE_API_BATCH_LIMIT));
                 }
                 Logger.infoMessage(
-                    `User ${user_modeus_id}: Prepared ${batchGetRequests.length} GET requests in ${getChunks.length} chunk(s).`
+                    `User ${user_modeus_id}: Prepared ${batchGetRequests.length} GET requests for DB-known events in ${getChunks.length} chunk(s).`
                 );
 
                 for (let chunkIndex = 0; chunkIndex < getChunks.length; chunkIndex++) {
-                    let currentGetChunk = getChunks[chunkIndex];
-                    let requests = [...currentGetChunk];
+                    const currentGetChunk = getChunks[chunkIndex];
+                    let realGetChunk = [...currentGetChunk];
                     const batchGetObj = {
                         accessToken: accessToken,
                         requests: currentGetChunk,
                         api: { name: "calendar", version: "v3" },
                     };
                     try {
-                        Logger.infoMessage(`User ${user_modeus_id}: Executing GET batch ${chunkIndex + 1}.`);
+                        Logger.infoMessage(
+                            `User ${user_modeus_id}: Executing GET batch ${chunkIndex + 1} for DB-known events.`
+                        );
                         const getBatchResponses = await RunBatch(batchGetObj);
 
                         if (Array.isArray(getBatchResponses)) {
-                            let idx = -1;
-                            for(let resp of getBatchResponses) {
-                                idx++;
-                                const originalReq = requests[idx];
-                                if (!originalReq) {
+                            for (let respIdx = 0; respIdx < getBatchResponses.length; respIdx++) {
+                                const resp = getBatchResponses[respIdx];
+                                const originalReq = realGetChunk[respIdx];
+                                if (!originalReq) continue;
+
+                                const fetchedGoogleId = originalReq.customOperationId;
+                                const correspondingModeusId = googleIdToModeusIdForGet.get(fetchedGoogleId);
+
+                                if (!correspondingModeusId) {
                                     Logger.warnMessage(
-                                        `User ${user_modeus_id}: GET batch response at index ${idx} has no corresponding original request in chunk ${
-                                            chunkIndex + 1
-                                        }.`
+                                        `User ${user_modeus_id}: Could not map fetched Google ID ${fetchedGoogleId} back to a Modeus ID.`
                                     );
                                     continue;
                                 }
-                                const opModeusId = originalReq.customOperationId;
 
+                                let isValidAndActive = false;
                                 if (resp.id) {
-                                    existingGoogleEventsMap.set(opModeusId, resp);
-                                } else {
+                                    if (resp.status === "cancelled") {
+                                        Logger.infoMessage(
+                                            `User ${user_modeus_id}: Event Modeus ID ${correspondingModeusId} (GCal ID ${fetchedGoogleId}) is 'cancelled' on Google. Will treat as needing new ID.`
+                                        );
+                                    } else {
+                                        isValidAndActive = true;
+                                    }
+                                } else if (resp.error.code === 404) {
                                     const errDetail = resp?.error ||
-                                        resp?.result?.error || { message: "Unknown GET error in batch response item" };
+                                        resp?.result?.error || { message: "Unknown GET error" };
                                     Logger.warnMessage(
-                                        `User ${user_modeus_id}: Error in GET batch response item for Modeus ID ${opModeusId}: ${errDetail.message} (Code: ${errDetail.code})`
+                                        `User ${user_modeus_id}: Error getting event Modeus ID ${correspondingModeusId} (GCal ID ${fetchedGoogleId}): ${errDetail.message} (Code: ${errDetail.code}). Will treat as needing new ID.`
                                     );
+                                }
+
+                                if (!isValidAndActive) {
+                                    await db.deleteCalendarEvent(`${correspondingModeusId}-${user_modeus_id}`);
+                                    modeusIdToActiveGoogleIdMap.delete(correspondingModeusId);
+                                    Logger.infoMessage(
+                                        `User ${user_modeus_id}: Removed mapping for Modeus ID ${correspondingModeusId} from DB and current sync map.`
+                                    );
+                                } else {
+                                    modeusIdToActiveGoogleIdMap.set(correspondingModeusId, resp.result.id);
                                 }
                             }
                         } else {
                             Logger.warnMessage(
-                                `User ${user_modeus_id}: GET batch response was not an array for chunk ${
+                                `User ${user_modeus_id}: GET batch response for DB-known events was not an array (chunk ${
                                     chunkIndex + 1
-                                }. Response: ${JSON.stringify(getBatchResponses)}`
+                                }).`
                             );
                         }
-                    } catch (getBatchError) {}
+                    } catch (getBatchError) {
+                        Logger.errorMessage(
+                            `User ${user_modeus_id}: Critical error executing GET batch for DB-known events (chunk ${
+                                chunkIndex + 1
+                            }). Events in this chunk will be treated as needing new IDs.`
+                        );
+
+                        for(const req of currentGetChunk){
+                            const gId = req.customOperationId;
+                            const mId = googleIdToModeusIdForGet.get(gId);
+                            if (mId) {
+                                await db.deleteCalendarEvent(`${mId}-${user_modeus_id}`);
+                                modeusIdToActiveGoogleIdMap.delete(mId);
+                            }
+                        }
+                    }
                     if (getChunks.length > 1 && chunkIndex < getChunks.length - 1) await delay(500);
                 }
             }
 
             let batchWriteRequests = [];
+
             for (const user_event_link of modeus_events_for_this_user) {
                 const modeus_event_id = user_event_link.event_id;
-                const googleCompatibleEventId = transformModeusIdToGoogleId(modeus_event_id);
-                if (!googleCompatibleEventId) continue;
-
-                const event_data = modeusEventDetailsCache.get(modeus_event_id);
-                if (!event_data) {
-                    Logger.warnMessage(
-                        `User ${user_modeus_id}: Missing cached details for Modeus event ${modeus_event_id} during write prep.`
-                    );
-                    continue;
+                let event_data;
+                if (modeusEventDetailsCache.has(modeus_event_id)) {
+                    event_data = modeusEventDetailsCache.get(modeus_event_id);
+                } else {
+                    let event_detail_records = await db.getEvent(modeus_event_id);
+                    if (
+                        event_detail_records[0].event_data
+                    ) {
+                        event_data = JSON.parse(event_detail_records[0].event_data);
+                        modeusEventDetailsCache.set(modeus_event_id, event_data);
+                    } else {
+                        Logger.warnMessage(
+                            `User ${user_modeus_id}: Missing event_data for Modeus ID ${modeus_event_id}. Skipping.`
+                        );
+                        continue;
+                    }
                 }
 
                 let sas_event = event_data.name.match(/\d.\d/g);
                 let event_name = `${event_data.name} / ${event_data.course}`;
                 let type = event_data.typeId === "LECT" ? "L" : "S";
                 let color = event_data.typeId === "LECT" ? "10" : "1";
-                
                 if (sas_event != null) event_name = `${sas_event}${type} / ${event_data.course}`;
                 let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
+
                 const eventResourceBase = {
                     summary: event_name,
                     description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${
@@ -776,24 +805,26 @@ async function recheckModeus() {
                     end: { dateTime: event_data.end, timeZone: "Asia/Yekaterinburg" },
                     location: event_data.room,
                     colorId: color,
-                    status: "confirmed"
+                    status: "confirmed",
                 };
 
-                if (existingGoogleEventsMap.has(modeus_event_id)) {
-                    console.log(event_name, "UPDATE");
+                if (modeusIdToActiveGoogleIdMap.has(modeus_event_id)) {
+                    const existingGoogleId = modeusIdToActiveGoogleIdMap.get(modeus_event_id);
                     batchWriteRequests.push({
                         method: "PUT",
-                        endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${googleCompatibleEventId}`,
+                        endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${existingGoogleId}`,
                         requestBody: eventResourceBase,
                         customOperationId: modeus_event_id,
+                        originalGoogleId: existingGoogleId,
                     });
                 } else {
-                    console.log(event_name, "INSERT");
+                    const newRandomGoogleId = crypto.randomBytes(16).toString("hex");
                     batchWriteRequests.push({
                         method: "POST",
                         endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events`,
-                        requestBody: { ...eventResourceBase, id: googleCompatibleEventId },
+                        requestBody: { ...eventResourceBase, id: newRandomGoogleId },
                         customOperationId: modeus_event_id,
+                        originalGoogleId: newRandomGoogleId,
                     });
                 }
             }
@@ -804,33 +835,76 @@ async function recheckModeus() {
                     writeChunks.push(batchWriteRequests.slice(i, i + GOOGLE_API_BATCH_LIMIT));
                 }
                 Logger.infoMessage(
-                    `User ${user_modeus_id}: Prepared ${batchWriteRequests.length} PUT/POST requests in ${writeChunks.length} chunk(s).`
+                    `User ${user_modeus_id}: Prepared ${batchWriteRequests.length} final PUT/POST requests in ${writeChunks.length} chunk(s).`
                 );
 
                 for (let chunkIndex = 0; chunkIndex < writeChunks.length; chunkIndex++) {
                     const currentWriteChunk = writeChunks[chunkIndex];
+                    let realWriteChunk = [...currentWriteChunk];
                     const batchWriteObj = {
                         accessToken: accessToken,
                         requests: currentWriteChunk,
                         api: { name: "calendar", version: "v3" },
                     };
                     try {
-                        Logger.infoMessage(`User ${user_modeus_id}: Executing PUT/POST batch ${chunkIndex + 1}.`);
+                        Logger.infoMessage(`User ${user_modeus_id}: Executing final PUT/POST batch ${chunkIndex + 1}.`);
                         const writeBatchResponses = await RunBatch(batchWriteObj);
+
+                        if (Array.isArray(writeBatchResponses)) {
+                            for (let respIdx = 0; respIdx < writeBatchResponses.length; respIdx++) {
+                                const resp = writeBatchResponses[respIdx];
+                                const originalReq = realWriteChunk[respIdx];
+                                if (!originalReq) continue;
+
+                                const opModeusId = originalReq.customOperationId;
+                                const eventTimestamp =
+                                    Math.floor(
+                                        new Date(modeusEventDetailsCache.get(opModeusId)?.start).getTime() / 1000
+                                    ) || Math.floor(Date.now() / 1000);
+                                const attemptedGoogleId = originalReq.originalGoogleId;
+                                
+                                if (resp.id) {
+                                    if (originalReq.method === "POST") {
+                                        if (resp.id !== attemptedGoogleId) {
+                                            Logger.warnMessage(
+                                                `User ${user_modeus_id}: POST success for Modeus ID ${opModeusId}, but GCal ID mismatch! Expected ${attemptedGoogleId}, got ${resp.id}. Saving actual returned ID.`
+                                            );
+                                        }
+                                        await db.saveCalendarEvent(`${opModeusId}-${user_modeus_id}`, resp.id, eventTimestamp);
+                                    }
+                                } else {
+                                    const errDetail = resp?.error ||
+                                        resp?.result?.error || { message: "Unknown error" };
+                                    if (originalReq.method === "PUT" && errDetail.code === 404) {
+                                        Logger.warnMessage(
+                                            `User ${user_modeus_id}: PUT failed with 404 for Modeus ID ${opModeusId} (GCal ID ${attemptedGoogleId}). Deleting DB record.`
+                                        );
+                                        await db.deleteCalendarEvent(`${opModeusId}-${user_modeus_id}`);
+                                    } else if (originalReq.method === "POST" && errDetail.code === 409) {
+                                        Logger.warnMessage(
+                                            `User ${user_modeus_id}: POST failed with 409 (Conflict) for Modeus ID ${opModeusId} with NEW GCal ID ${attemptedGoogleId}. This is unexpected with random IDs. Not saving to DB.`
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            Logger.warnMessage(
+                                `User ${user_modeus_id}: Final PUT/POST batch response was not an array (chunk ${
+                                    chunkIndex + 1
+                                }).`
+                            );
+                        }
                     } catch (writeBatchError) {
-                        console.log(writeBatchError);
                         Logger.errorMessage(
-                            `User ${user_modeus_id}: Critical error executing PUT/POST batch chunk ${chunkIndex + 1}: ${
-                                writeBatchError.message
-                            }.`
+                            `User ${user_modeus_id}: Critical error executing final PUT/POST batch (chunk ${
+                                chunkIndex + 1
+                            }): ${writeBatchError.message || JSON.stringify(writeBatchError)}.`
                         );
                     }
                     if (writeChunks.length > 1 && chunkIndex < writeChunks.length - 1) await delay(1000);
                 }
             } else {
-                Logger.infoMessage(
-                    `User ${user_modeus_id}: No events to create or update in Google Calendar after GET checks.`
-                );
+                Logger.infoMessage(`User ${user_modeus_id}: No events to create or update in Google Calendar.`);
             }
         } catch (userProcessingError) {
             Logger.errorMessage(
@@ -1146,7 +1220,8 @@ function registerUtilityCommands() {
         (async () => {
             ctx.deleteMessage(ctx.message.message_id).catch(() => {});
 
-            await db.saveCalendarID(ctx.from.id, null);
+            db.saveCalendarID(ctx.from.id, null);
+            ctx.reply("✅ Успех! Был создан новый календарь. Теперь твои события будут отображаться в нём.");
         })();
     });
 }

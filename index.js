@@ -8,6 +8,7 @@ const config = require("./config");
 const Database = require("./src/Database");
 const tg = require("telegraf");
 const { google } = require("googleapis");
+const { RunBatch } = require("gbatchrequests");
 
 const bot = new tg.Telegraf(config.credentials.telegram);
 let db = new Database();
@@ -19,6 +20,14 @@ let local_token_cache = {
     token: "",
     timestamp: 0,
 };
+
+function transformModeusIdToGoogleId(modeusEventId) {
+    if (!modeusEventId || typeof modeusEventId !== "string") {
+        Logger.warnMessage(`Invalid Modeus Event ID for transformation: ${modeusEventId}`);
+        return null;
+    }
+    return modeusEventId.replace(/-/g, "").toLowerCase();
+}
 
 let year = (d) => {
     return ("0000" + d.getUTCFullYear()).slice(-4);
@@ -441,33 +450,45 @@ async function callGoogleApiWithRetry(apiCallFunction, logContext = "", maxRetri
         try {
             return await apiCallFunction();
         } catch (error) {
-            const isRateLimitError =
-                error.code === 429 ||
-                (error.code === 403 &&
-                    error.errors &&
-                    error.errors.some((e) => e.reason === "rateLimitExceeded" || e.reason === "userRateLimitExceeded"));
+            console.log(error);
+            const statusCode = error.code;
+            const detailedErrors = error.errors;
 
-            const isServiceUnavailable = error.code === 503;
+            let isSpecificRateLimitReason = false;
+            if (statusCode === 403 && detailedErrors && Array.isArray(detailedErrors)) {
+                isSpecificRateLimitReason = detailedErrors.some(
+                    (e) => e.reason === "rateLimitExceeded" || e.reason === "userRateLimitExceeded"
+                );
+            }
+
+            const isRateLimitError = statusCode === 429 || isSpecificRateLimitReason;
+            const isServiceUnavailable = statusCode === 503;
 
             if ((isRateLimitError || isServiceUnavailable) && attempt < maxRetries - 1) {
+                attempt++;
                 Logger.warnMessage(
                     `${
                         isRateLimitError ? "Rate limit" : "Service unavailable"
-                    } encountered for ${logContext}. Retrying in ${currentDelayMs / 1000}s... (Attempt ${
-                        attempt + 1
-                    }/${maxRetries})`
+                    } (Code: ${statusCode}) encountered for ${logContext}. Retrying in ${
+                        currentDelayMs / 1000
+                    }s... (Attempt ${attempt}/${maxRetries})`
                 );
                 await delay(currentDelayMs + Math.random() * 1000);
-                currentDelayMs *= 2;
-                if (currentDelayMs > 60000) currentDelayMs = 60000;
-                attempt++;
+                currentDelayMs = Math.min(currentDelayMs * 2, 60000);
             } else {
+                let errorMessage = "Unknown API error";
+                if (detailedErrors && detailedErrors[0] && detailedErrors[0].message) {
+                    errorMessage = detailedErrors[0].message;
+                } else if (error.message) {
+                    errorMessage = error.message;
+                }
                 Logger.errorMessage(
-                    `Final error for ${logContext} after ${attempt + 1} attempts: ${error.message} (Code: ${
-                        error.code
-                    })`
+                    `Final error for ${logContext} after ${attempt + 1} attempts: ${errorMessage} (Code: ${statusCode})`
                 );
-                throw error;
+                const finalError = new Error(`Final error for ${logContext}: ${errorMessage}`);
+                finalError.code = statusCode;
+                finalError.originalError = error;
+                throw finalError; // Throw after logging
             }
         }
     }
@@ -480,356 +501,349 @@ async function init() {
     } catch (e) {
         console.log(e);
         Logger.errorMessage("Unable to get Modeus Access Token. Dying.");
-        throw "Unable to get Modeus Access Token.";
+        throw e;
     }
 
     setInterval(recheckModeus, 15 * 60 * 1000);
     recheckModeus();
+}
 
-    async function recheckModeus() {
-        Logger.infoMessage("Rechecking Modeus Events...");
-        let attendees = [];
-        let recheck_started_modeus = Math.floor(new Date().getTime() / 1000);
+async function recheckModeus() {
+    Logger.infoMessage("Rechecking Modeus Events...");
+    let attendees_for_modeus_fetch = [];
+    let recheck_started_modeus = Math.floor(new Date().getTime() / 1000);
 
-        let students_stat = 0;
-        let events_stat = 0;
+    let students_stat = 0;
+    let events_stat = 0;
 
-        async function fetchAssociatedEvents(attendee_list) {
-            let events = await findModeusEvents(attendee_list);
-
-            let db_save_promises = [];
-            for (const event of events) {
-                events_stat++;
-                let event_object = {
-                    id: event.info.id,
-                    name: event.info.name,
-                    typeId: event.info.typeId,
-                    start: event.info.startsAt,
-                    end: event.info.endsAt,
-                    room: event.room_name,
-                    course: event.course,
-                    attendees: event.attendee_list,
-                    teachers: event.teachers,
-                };
-
-                let timestamp = new Date(event.info.startsAt).getTime() / 1000;
-
-                for (const attendee_id of attendee_list) {
-                    if (!event_object.attendees.includes(attendee_id)) {
-                        continue;
-                    }
-                    db_save_promises.push(
-                        db.saveUserEvent(
-                            `${attendee_id};${event.info.id}`,
-                            attendee_id,
-                            event.info.id,
-                            recheck_started_modeus,
-                            timestamp
-                        )
-                    );
-                }
+    async function fetchAssociatedEvents(attendee_list) {
+        let events = await findModeusEvents(attendee_list);
+        let db_save_promises = [];
+        for (const event of events) {
+            events_stat++;
+            let event_object = {
+                id: event.info.id,
+                name: event.info.name,
+                typeId: event.info.typeId,
+                start: event.info.startsAt,
+                end: event.info.endsAt,
+                room: event.room_name,
+                course: event.course,
+                attendees: event.attendee_list,
+                teachers: event.teachers,
+            };
+            let timestamp = new Date(event.info.startsAt).getTime() / 1000;
+            for (const attendee_id of attendee_list) {
+                if (!event_object.attendees.includes(attendee_id)) continue;
                 db_save_promises.push(
-                    db.saveEvent(event.info.id, recheck_started_modeus, timestamp, JSON.stringify(event_object))
+                    db.saveUserEvent(
+                        `${attendee_id};${event.info.id}`,
+                        attendee_id,
+                        event.info.id,
+                        recheck_started_modeus,
+                        timestamp
+                    )
                 );
             }
-            await Promise.all(db_save_promises);
+            db_save_promises.push(
+                db.saveEvent(event.info.id, recheck_started_modeus, timestamp, JSON.stringify(event_object))
+            );
         }
+        await Promise.all(db_save_promises);
+    }
 
-        let students = db.getRecheckUsers();
+    let students = db.getRecheckUsers();
+    for await (const student_user of students) {
+        if (attendees_for_modeus_fetch.length >= 25) {
+            await fetchAssociatedEvents(attendees_for_modeus_fetch);
+            attendees_for_modeus_fetch = [];
+        }
+        attendees_for_modeus_fetch.push(student_user.attendee_id);
+        students_stat++;
+    }
+    if (attendees_for_modeus_fetch.length > 0) {
+        await fetchAssociatedEvents(attendees_for_modeus_fetch);
+    }
 
-        for await (const attendee of students) {
-            if (attendees.length >= 25) {
-                await fetchAssociatedEvents(attendees);
-                attendees = [];
+    Logger.successMessage("Rechecked Modeus Events.");
+    await db.setConfigValue("lastRefresh", recheck_started_modeus);
+    console.log(`Modeus Recheck Stats:\nStudents: ${students_stat}\nEvents: ${events_stat}`);
+    console.log(`Modeus Recheck Time: ${Math.floor(new Date().getTime() / 1000) - recheck_started_modeus} seconds`);
+    let monday_timestamp = Math.floor(getDates().start_timestamp / 1000);
+    await db.cleanupOldEvents(monday_timestamp, recheck_started_modeus);
+    await db.cleanupOldStudentEvents(monday_timestamp, recheck_started_modeus);
+
+    Logger.infoMessage("Syncing with Google Calendar...");
+    let google_sync_start_time = Math.floor(new Date().getTime() / 1000);
+    const GOOGLE_API_BATCH_LIMIT = 50;
+
+    let logged_google_users = db.getLoggedAttendees();
+    const calendarOAuthInstance = new google.auth.OAuth2(
+        config.google.client_id,
+        config.google.secret_id,
+        config.google.redirect
+    );
+
+    for await (const gcal_user of logged_google_users) {
+        let user_modeus_id = gcal_user.attendee_id;
+        Logger.infoMessage(`Starting Google Calendar sync for user ${user_modeus_id}`);
+        try {
+            let modeus_events_for_this_user = await db.getUserEvents(user_modeus_id);
+            if (modeus_events_for_this_user.length === 0) {
+                Logger.infoMessage(`User ${user_modeus_id}: No Modeus events to sync.`);
+                continue;
             }
-            attendees.push(attendee.attendee_id);
-            students_stat++;
-        }
-        if (attendees.length != 0) {
-            await fetchAssociatedEvents(attendees);
-            attendees = [];
-        }
 
-        Logger.successMessage("Rechecked Modeus Events.");
-        await db.setConfigValue("lastRefresh", recheck_started_modeus);
+            let user_details_array = await db.findAttendee(user_modeus_id);
+            if (!user_details_array || user_details_array.length === 0) {
+                Logger.errorMessage(`User details not found for ${user_modeus_id}`);
+                continue;
+            }
+            let user_details = user_details_array[0];
+            if (!user_details.google_token) {
+                Logger.infoMessage(`User ${user_modeus_id} has no Google Token`);
+                continue;
+            }
 
-        console.log(`Modeus Recheck Stats:\nStudents: ${students_stat}\nEvents: ${events_stat}`);
-        console.log(`Modeus Recheck Time: ${Math.floor(new Date().getTime() / 1000) - recheck_started_modeus} seconds`);
+            calendarOAuthInstance.setCredentials({ refresh_token: user_details.google_token });
+            const { token: accessToken } = await calendarOAuthInstance.getAccessToken();
+            if (!accessToken) {
+                Logger.errorMessage(`No access token for ${user_modeus_id}`);
+                continue;
+            }
 
-        let monday_timestamp = Math.floor(getDates().start_timestamp / 1000);
+            const calendar_single_op = google.calendar({ version: "v3", auth: calendarOAuthInstance });
+            let app_calendar_id = user_details.calendar_id;
 
-        await db.cleanupOldEvents(monday_timestamp, recheck_started_modeus);
-        await db.cleanupOldStudentEvents(monday_timestamp, recheck_started_modeus);
-
-        /*
-            Handle Google Calendar Here
-        */
-
-        Logger.infoMessage("Syncing with Google Calendar...");
-        let google_sync_start_time = Math.floor(new Date().getTime() / 1000);
-        const GOOGLE_API_BATCH_SIZE = 50;
-
-        let logged_attendees = db.getLoggedAttendees();
-
-        const calendarOAuthInstance = new google.auth.OAuth2(
-            config.google.client_id,
-            config.google.secret_id,
-            config.google.redirect
-        );
-
-        for await (const calendar_attendee of logged_attendees) {
-            let ca_id = calendar_attendee.attendee_id;
-            Logger.infoMessage(`Starting Google Calendar sync for user ${ca_id}`);
             try {
-                let calendar_events_to_sync = await db.getUserEvents(ca_id);
-                let calendar_person_array = await db.findAttendee(ca_id);
-
-                if (!calendar_person_array || calendar_person_array.length === 0) {
-                    Logger.errorMessage(`Calendar person not found for attendee ID: ${ca_id}. Skipping.`);
-                    continue;
-                }
-                let calendar_person = calendar_person_array[0];
-
-                if (!calendar_person.google_token) {
-                    Logger.infoMessage(`User ${ca_id} has no Google token. Skipping Google Calendar sync.`);
-                    continue;
-                }
-
-                calendarOAuthInstance.setCredentials({
-                    refresh_token: calendar_person.google_token,
-                });
-                const calendar = google.calendar({ version: "v3", auth: calendarOAuthInstance });
-
-                let app_calendar_id = calendar_person.calendar_id;
-
-                try {
-                    if (app_calendar_id == null) {
-                        Logger.infoMessage(`No app_calendar_id stored for user ${ca_id}. Will attempt to create one.`);
-                        throw { code: 404, message: "Calendar not created locally" };
-                    }
-                    await callGoogleApiWithRetry(
-                        () => calendar.calendars.get({ calendarId: app_calendar_id }),
-                        `get calendar ${app_calendar_id} for user ${ca_id}`
+                if (app_calendar_id == null) {
+                    Logger.infoMessage(
+                        `No app_calendar_id stored for user ${user_modeus_id}. Will attempt to create one.`
                     );
-                    Logger.infoMessage(`Calendar ${app_calendar_id} verified for user ${ca_id}`);
+                    throw { code: 404, message: "Calendar not created locally" };
+                }
+
+                await callGoogleApiWithRetry(
+                    () => calendar_single_op.calendars.get({ calendarId: app_calendar_id }),
+                    `get calendar ${app_calendar_id} for user ${user_modeus_id}`
+                );
+                Logger.infoMessage(`Calendar ${app_calendar_id} found for user ${user_modeus_id}`);
+            } catch (e) {
+                Logger.infoMessage(`No app_calendar_id for user ${user_modeus_id}. Creating.`);
+                try {
+                    const newCal = await callGoogleApiWithRetry(
+                        () =>
+                            calendar_single_op.calendars.insert({
+                                requestBody: { summary: "Modeus Integration", timeZone: "Asia/Yekaterinburg" },
+                            }),
+                        `insert calendar for user ${user_modeus_id}`
+                    );
+                    app_calendar_id = newCal.data.id;
+                    await db.saveCalendarID(user_details.telegram_id, app_calendar_id);
+                    Logger.infoMessage(`Created new calendar ${app_calendar_id} for user ${user_modeus_id}`);
                 } catch (e) {
-                    if (e.code === 404) {
-                        Logger.infoMessage(
-                            `Calendar ID ${app_calendar_id || "N/A"} not found for user ${ca_id}. Creating a new one.`
-                        );
-                        try {
-                            const newCalendarResponse = await callGoogleApiWithRetry(
-                                () =>
-                                    calendar.calendars.insert({
-                                        requestBody: {
-                                            summary: "Modeus Integration",
-                                            timeZone: "Asia/Yekaterinburg",
-                                        },
-                                    }),
-                                `insert calendar for user ${ca_id}`
-                            );
-                            app_calendar_id = newCalendarResponse.data.id;
-                            await db.saveCalendarID(calendar_person.telegram_id, app_calendar_id);
-                            Logger.infoMessage(`Created new calendar ${app_calendar_id} for user ${ca_id}`);
-                        } catch (createError) {
-                            Logger.errorMessage(
-                                `Failed to create new calendar for user ${ca_id}: ${createError.message}. Skipping user.`
-                            );
-                            continue;
-                        }
+                    Logger.errorMessage(
+                        `Failed to create new calendar for user ${user_modeus_id}: ${e.message}. Skipping user.`
+                    );
+                    continue;
+                }
+            }
+
+            if (!app_calendar_id) {
+                Logger.errorMessage(`App calendar ID null for ${user_modeus_id} after check/create.`);
+                continue;
+            }
+
+            let batchGetRequests = [];
+            let modeusEventDetailsCache = new Map();
+
+            for (const user_event_link of modeus_events_for_this_user) {
+                const modeus_event_id = user_event_link.event_id;
+                const googleCompatibleEventId = transformModeusIdToGoogleId(modeus_event_id);
+                if (!googleCompatibleEventId) continue;
+
+                if (!modeusEventDetailsCache.has(modeus_event_id)) {
+                    let event_detail_records = await db.getEvent(modeus_event_id);
+                    if (event_detail_records[0].event_data) {
+                        modeusEventDetailsCache.set(modeus_event_id, JSON.parse(event_detail_records[0].event_data));
                     } else {
-                        Logger.errorMessage(
-                            `Error fetching/verifying calendar for user ${ca_id}: ${e.message}. Skipping user.`
-                        );
+                        Logger.warnMessage(`Missing full details for Modeus event ${modeus_event_id}. Cannot sync.`);
                         continue;
                     }
                 }
 
-                if (!app_calendar_id) {
-                    Logger.errorMessage(
-                        `app_calendar_id is null for user ${ca_id} even after creation attempt. Skipping user.`
-                    );
-                    continue;
-                }
+                batchGetRequests.push({
+                    method: "GET",
+                    endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${googleCompatibleEventId}`,
+                    customOperationId: modeus_event_id,
+                });
+            }
 
+            let existingGoogleEventsMap = new Map();
+            if (batchGetRequests.length > 0) {
+                const getChunks = [];
+                for (let i = 0; i < batchGetRequests.length; i += GOOGLE_API_BATCH_LIMIT) {
+                    getChunks.push(batchGetRequests.slice(i, i + GOOGLE_API_BATCH_LIMIT));
+                }
                 Logger.infoMessage(
-                    `Processing ${calendar_events_to_sync.length} events for user ${ca_id} in calendar ${app_calendar_id}`
+                    `User ${user_modeus_id}: Prepared ${batchGetRequests.length} GET requests in ${getChunks.length} chunk(s).`
                 );
 
-                const eventChunks = [];
-                for (let i = 0; i < calendar_events_to_sync.length; i += GOOGLE_API_BATCH_SIZE) {
-                    eventChunks.push(calendar_events_to_sync.slice(i, i + GOOGLE_API_BATCH_SIZE));
-                }
-
-                for (let chunkIndex = 0; chunkIndex < eventChunks.length; chunkIndex++) {
-                    const chunk = eventChunks[chunkIndex];
-                    const batch = calendar.batch({ path: "batch/calendar/v3" });
-                    let dbOperationsPromises = [];
-                    let operationsInBatch = 0;
-
-                    Logger.infoMessage(
-                        `User ${ca_id}: Processing event chunk ${chunkIndex + 1}/${eventChunks.length} with ${
-                            chunk.length
-                        } events.`
-                    );
-
-                    for (const calendar_event of chunk) {
-                        try {
-                            let modeus_event_id = calendar_event.event_id;
-                            let event_record_array = await db.getEvent(modeus_event_id);
-
-                            if (
-                                !event_record_array ||
-                                event_record_array.length === 0 ||
-                                !event_record_array[0] ||
-                                !event_record_array[0].event_data
-                            ) {
-                                Logger.warnMessage(
-                                    `Event data not found or invalid for DB event_id: ${modeus_event_id} (user ${ca_id}). Skipping this event in batch.`
-                                );
-                                continue;
-                            }
-                            let event_data = JSON.parse(event_record_array[0].event_data);
-                            let event_timestamp = new Date(event_data.start).getTime() / 1000;
-
-                            let sas_event = event_data.name.match(/\d.\d/g);
-                            let event_name = `${event_data.name} / ${event_data.course}`;
-                            let type = event_data.typeId === "LECT" ? "L" : "S";
-                            let color = event_data.typeId === "LECT" ? "10" : "1";
-
-                            if (sas_event != null) event_name = `${sas_event}${type} / ${event_data.course}`;
-                            let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
-
-                            const eventResource = {
-                                summary: event_name,
-                                description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${
-                                    event_data.attendees.length - event_data.teachers.length
-                                } участников\n\n${professor_list}`,
-                                start: { dateTime: event_data.start, timeZone: "Asia/Yekaterinburg" },
-                                end: { dateTime: event_data.end, timeZone: "Asia/Yekaterinburg" },
-                                location: event_data.room,
-                                colorId: color,
-                            };
-
-                            const storedGoogleEvents = await db.findCalendarEvent(modeus_event_id);
-                            let storedGoogleEventId =
-                                storedGoogleEvents.length > 0 && storedGoogleEvents[0].calendar_id
-                                    ? storedGoogleEvents[0].calendar_id
-                                    : null;
-
-                            const callback = (err, res) => {
-                                if (err) {
-                                    Logger.errorMessage(
-                                        `Batch operation error for Modeus Event ${modeus_event_id} (User ${ca_id}): ${err.message} (Code: ${err.code})`
-                                    );
-                                    // If a 404 on update, try to delete local and it might get inserted next time or in a retry of the whole batch
-                                    if (err.code === 404 && storedGoogleEventId) {
-                                        // If it was an update that failed with 404
-                                        Logger.warnMessage(
-                                            `Google Event ${storedGoogleEventId} (Modeus ${modeus_event_id}) not found during batch update. Deleting local association.`
-                                        );
-                                        dbOperationsPromises.push(
-                                            db
-                                                .deleteCalendarEvent(modeus_event_id)
-                                                .catch((delErr) =>
-                                                    Logger.errorMessage(
-                                                        `Failed to delete local calendar event ${modeus_event_id} after 404: ${delErr.message}`
-                                                    )
-                                                )
-                                        );
-                                    }
-                                } else if (res && res.data && res.data.id) {
-                                    Logger.infoMessage(
-                                        `Batch operation success for Modeus Event ${modeus_event_id} (User ${ca_id}). Google Event ID: ${res.data.id}`
-                                    );
-                                    dbOperationsPromises.push(
-                                        db
-                                            .saveCalendarEvent(modeus_event_id, res.data.id, event_timestamp)
-                                            .catch((saveErr) =>
-                                                Logger.errorMessage(
-                                                    `Failed to save Google Event ID ${res.data.id} for Modeus ${modeus_event_id}: ${saveErr.message}`
-                                                )
-                                            )
-                                    );
-                                } else {
-                                    Logger.warnMessage(
-                                        `Batch operation for Modeus Event ${modeus_event_id} (User ${ca_id}) completed with no error but no response data/ID.`
-                                    );
+                for (let chunkIndex = 0; chunkIndex < getChunks.length; chunkIndex++) {
+                    const currentGetChunk = getChunks[chunkIndex];
+                    const batchGetObj = {
+                        accessToken: accessToken,
+                        requests: currentGetChunk,
+                        api: { name: "calendar", version: "v3" },
+                    };
+                    try {
+                        Logger.infoMessage(`User ${user_modeus_id}: Executing GET batch ${chunkIndex + 1}.`);
+                        const getBatchResponses = await RunBatch(batchGetObj);
+                        if (Array.isArray(getBatchResponses)) {
+                            getBatchResponses.forEach((resp, idx) => {
+                                const originalReq = currentGetChunk[idx];
+                                const opModeusId = originalReq.customOperationId;
+                                if (resp.result.id) {
+                                    existingGoogleEventsMap.set(opModeusId, resp.result);
                                 }
-                            };
-
-                            if (storedGoogleEventId) {
-                                batch.add(
-                                    {
-                                        method: "PUT",
-                                        path: `/calendar/v3/calendars/${app_calendar_id}/events/${storedGoogleEventId}`,
-                                        body: eventResource,
-                                    },
-                                    callback
-                                );
-                                operationsInBatch++;
-                            } else {
-                                batch.add(
-                                    {
-                                        method: "POST",
-                                        path: `/calendar/v3/calendars/${app_calendar_id}/events`,
-                                        body: eventResource,
-                                    },
-                                    callback
-                                );
-                                operationsInBatch++;
-                            }
-                        } catch (prepError) {
-                            Logger.errorMessage(
-                                `Error preparing event ${calendar_event.event_id} for batch (User ${ca_id}): ${prepError.message}`
+                            });
+                        } else {
+                            Logger.warnMessage(
+                                `User ${user_modeus_id}: GET batch response was not an array for chunk ${
+                                    chunkIndex + 1
+                                }.`
                             );
                         }
-                    }
-
-                    if (operationsInBatch > 0) {
-                        Logger.infoMessage(
-                            `User ${ca_id}: Executing batch with ${operationsInBatch} operations for chunk ${
-                                chunkIndex + 1
+                    } catch (getBatchError) {
+                        Logger.errorMessage(
+                            `User ${user_modeus_id}: Critical error executing GET batch chunk ${chunkIndex + 1}: ${
+                                getBatchError.message
                             }.`
                         );
-                        try {
-                            await callGoogleApiWithRetry(
-                                () => batch.execute(),
-                                `execute batch for user ${ca_id}, chunk ${chunkIndex + 1}`
-                            );
+                    }
+                    if (getChunks.length > 1 && chunkIndex < getChunks.length - 1) await delay(500);
+                }
+            }
 
-                            await Promise.all(dbOperationsPromises);
-                            Logger.infoMessage(
-                                `User ${ca_id}: Batch chunk ${chunkIndex + 1} processed, including DB updates.`
-                            );
-                        } catch (batchExecuteError) {
-                            Logger.errorMessage(
-                                `User ${ca_id}: Critical error executing batch chunk ${chunkIndex + 1}: ${
-                                    batchExecuteError.message
-                                }`
+            let batchWriteRequests = [];
+            for (const user_event_link of modeus_events_for_this_user) {
+                const modeus_event_id = user_event_link.event_id;
+                const googleCompatibleEventId = transformModeusIdToGoogleId(modeus_event_id);
+                if (!googleCompatibleEventId) continue;
+
+                const event_data = modeusEventDetailsCache.get(modeus_event_id);
+                if (!event_data) {
+                    Logger.warnMessage(
+                        `User ${user_modeus_id}: Missing cached details for Modeus event ${modeus_event_id} during write prep.`
+                    );
+                    continue;
+                }
+
+                let sas_event = event_data.name.match(/\d.\d/g);
+                let event_name = `${event_data.name} / ${event_data.course}`;
+                let type = event_data.typeId === "LECT" ? "L" : "S";
+                let color = event_data.typeId === "LECT" ? "10" : "1";
+                if (sas_event != null) event_name = `${sas_event}${type} / ${event_data.course}`;
+                let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
+                const eventResourceBase = {
+                    summary: event_name,
+                    description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${
+                        event_data.attendees.length - event_data.teachers.length
+                    } участников\n\n${professor_list}`,
+                    start: { dateTime: event_data.start, timeZone: "Asia/Yekaterinburg" },
+                    end: { dateTime: event_data.end, timeZone: "Asia/Yekaterinburg" },
+                    location: event_data.room,
+                    colorId: color,
+                };
+
+                if (existingGoogleEventsMap.has(modeus_event_id)) {
+                    batchWriteRequests.push({
+                        method: "PUT",
+                        endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${googleCompatibleEventId}`,
+                        requestBody: eventResourceBase,
+                        customOperationId: modeus_event_id,
+                    });
+                } else {
+                    batchWriteRequests.push({
+                        method: "POST",
+                        endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events`,
+                        requestBody: { ...eventResourceBase, id: googleCompatibleEventId },
+                        customOperationId: modeus_event_id,
+                    });
+                }
+            }
+
+            if (batchWriteRequests.length > 0) {
+                const writeChunks = [];
+                for (let i = 0; i < batchWriteRequests.length; i += GOOGLE_API_BATCH_LIMIT) {
+                    writeChunks.push(batchWriteRequests.slice(i, i + GOOGLE_API_BATCH_LIMIT));
+                }
+                Logger.infoMessage(
+                    `User ${user_modeus_id}: Prepared ${batchWriteRequests.length} PUT/POST requests in ${writeChunks.length} chunk(s).`
+                );
+
+                for (let chunkIndex = 0; chunkIndex < writeChunks.length; chunkIndex++) {
+                    const currentWriteChunk = writeChunks[chunkIndex];
+                    const batchWriteObj = {
+                        accessToken: accessToken,
+                        requests: currentWriteChunk,
+                        api: { name: "calendar", version: "v3" },
+                    };
+                    try {
+                        Logger.infoMessage(`User ${user_modeus_id}: Executing PUT/POST batch ${chunkIndex + 1}.`);
+                        const writeBatchResponses = await RunBatch(batchWriteObj);
+                        if (Array.isArray(writeBatchResponses)) {
+                            writeBatchResponses.forEach((resp, idx) => {
+                                const originalReq = currentWriteChunk[idx];
+                                const opModeusId = originalReq.customOperationId;
+                                if (resp && resp.result && resp.result.id) {
+                                    Logger.infoMessage(
+                                        `User ${user_modeus_id}: Batch PUT/POST op success for Modeus ID ${opModeusId}, GCal ID: ${resp.result.id}`
+                                    );
+                                } else {
+                                    const errDetail = resp?.error ||
+                                        resp?.result?.error || { message: "Unknown PUT/POST error in batch" };
+                                    Logger.errorMessage(
+                                        `User ${user_modeus_id}: Batch PUT/POST op error for Modeus ID ${opModeusId}: ${errDetail.message} (Code: ${errDetail.code})`
+                                    );
+                                    if (originalReq.method === "POST" && errDetail.code === 409) {
+                                        Logger.warnMessage(
+                                            `User ${user_modeus_id}: Event (Modeus ${opModeusId}, GCal ${transformModeusIdToGoogleId(
+                                                opModeusId
+                                            )}) POST failed with 409 (Conflict).`
+                                        );
+                                    }
+                                }
+                            });
+                        } else {
+                            Logger.warnMessage(
+                                `User ${user_modeus_id}: PUT/POST batch response was not an array for chunk ${
+                                    chunkIndex + 1
+                                }.`
                             );
                         }
-                    } else {
-                        Logger.infoMessage(
-                            `User ${ca_id}: No operations to execute in batch for chunk ${chunkIndex + 1}.`
+                    } catch (writeBatchError) {
+                        Logger.errorMessage(
+                            `User ${user_modeus_id}: Critical error executing PUT/POST batch chunk ${chunkIndex + 1}: ${
+                                writeBatchError.message
+                            }.`
                         );
                     }
-                    await delay(1000); // Delay between batches for the same user
-                } // end of for...of eventChunks
-                Logger.infoMessage(`Finished Google Calendar sync for user ${ca_id}`);
-                await delay(1000); // Delay between users
-            } catch (userProcessingError) {
-                Logger.errorMessage(
-                    `Overall error processing Google Calendar for user ${ca_id}: ${userProcessingError.message} ${userProcessingError.stack}`
+                    if (writeChunks.length > 1 && chunkIndex < writeChunks.length - 1) await delay(1000);
+                }
+            } else {
+                Logger.infoMessage(
+                    `User ${user_modeus_id}: No events to create or update in Google Calendar after GET checks.`
                 );
             }
-        } // End of for await...of logged_attendees
-
-        Logger.successMessage("Finished syncing all users with Google Calendar.");
-        console.log(
-            `Google Sync Total Time: ${Math.floor(new Date().getTime() / 1000) - google_sync_start_time} seconds`
-        );
+        } catch (userProcessingError) {
+            Logger.errorMessage(
+                `Overall error processing Google Calendar for user ${user_modeus_id}: ${userProcessingError.message} ${userProcessingError.stack}`
+            );
+        }
     }
+    Logger.successMessage("Finished syncing all users with Google Calendar.");
+    console.log(`Google Sync Total Time: ${Math.floor(new Date().getTime() / 1000) - google_sync_start_time} seconds`);
 }
 
 let textHandlers = [];
@@ -844,10 +858,50 @@ bot.hears(/^(?!\/).*$/, (ctx) => {
     }
 });
 
+textHandlers.push(async (ctx) => {
+    if (ctx.from.id != config.admin) return;
+    if (ctx.message.text == "reset_calendars") {
+        try {
+            let logged_google_users = db.getLoggedAttendees();
+            const calendarOAuthInstance = new google.auth.OAuth2(
+                config.google.client_id,
+                config.google.secret_id,
+                config.google.redirect
+            );
+            for await (const gcal_user of logged_google_users) {
+                let user_modeus_id = gcal_user.attendee_id;
+                let user_details_array = await db.findAttendee(user_modeus_id);
+                let user_details = user_details_array[0];
+                if (!user_details.google_token) {
+                    Logger.infoMessage(`User ${user_modeus_id} has no Google Token`);
+                    continue;
+                }
+                calendarOAuthInstance.setCredentials({ refresh_token: user_details.google_token });
+                const calendar_single_op = google.calendar({ version: "v3", auth: calendarOAuthInstance });
+                let app_calendar_id = user_details.calendar_id;
+
+                await calendar_single_op.calendars.delete({ calendarId: app_calendar_id }).catch((e) => {console.log(e)});
+                await db.saveCalendarID(user_details.telegram_id, null);
+            }
+        } catch (e) {
+            console.log(e);
+        }
+        ctx.reply("Done - Deleted Calendars");
+    }
+    if (ctx.message.text == "redo_checks") {
+        try {
+            await recheckModeus();
+        } catch (e) {
+            console.log(e);
+        }
+        ctx.reply("Done - Rechecked Modeus Events");
+    }
+});
+
 bot.action(/reset_listeners/, async (ctx) => {
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery().catch(() => {});
     user_states.set(ctx.from.id, "none");
-    ctx.deleteMessage(ctx.callbackQuery?.message?.message_id).catch(()=>{});;
+    ctx.deleteMessage(ctx.callbackQuery?.message?.message_id).catch(() => {});
 });
 
 init();
@@ -862,12 +916,12 @@ function registerInfoCommands() {
             {
                 parse_mode: "HTML",
             }
-        );
+        ).catch((e) => Logger.errorMessage(`Error sending help dialog: ${e.message}`));
     }
 
     bot.command("info", (ctx) => {
         (async () => {
-            ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
+            ctx.deleteMessage(ctx.message.message_id).catch(() => {});
 
             let user_info = await db.getUserInfo(ctx.from.id);
 
@@ -902,24 +956,24 @@ function registerInfoCommands() {
                 {
                     parse_mode: "HTML",
                 }
-            );
+            ).catch((e) => Logger.errorMessage(`Error sending info reply: ${e.message}`));
         })();
     });
 
     bot.start((ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
         sendHelpDialog(ctx);
     });
 
     bot.help((ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
         sendHelpDialog(ctx);
     });
 }
 
 function registerModeusSync() {
     bot.command("link_modeus", (ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
         ctx.reply(
             `<b><u>🎓 Подключение Modeus</u></b>\n\nВведи полное ФИО в таком порядке:\n<code>Иванов Иван Иванович</code>`,
             {
@@ -928,7 +982,7 @@ function registerModeusSync() {
                     inline_keyboard: [[{ text: "❌ Отмена", callback_data: "reset_listeners" }]],
                 },
             }
-        );
+        ).catch((e) => Logger.errorMessage(`Error sending link_modeus prompt: ${e.message}`));
         user_states.set(ctx.from.id, "modeus_listener");
     });
 
@@ -936,7 +990,7 @@ function registerModeusSync() {
         if (user_states.get(ctx.from.id) != "modeus_listener") {
             return;
         }
-        async function executeLogic() {
+        try {
             let user_name = ctx.message.text;
             let search_results = await findModeusUser(user_name);
 
@@ -944,43 +998,69 @@ function registerModeusSync() {
 
             for (const student of search_results) {
                 if (buttons.length >= 5) {
-                    continue;
+                    break;
                 }
                 buttons.push([{ text: `${student.name}${student.student}`, callback_data: `modeus_${student.id}` }]);
             }
 
-            ctx.reply(
-                `<b><u>🎓 Выбери свой профиль</u></b>\n\nВыбери свой профиль из <b>${search_results.length}</b> доступных.\nЕсли нет твоего профиля, напиши @artem2584`,
-                {
-                    parse_mode: "HTML",
-                    reply_markup: {
-                        inline_keyboard: buttons,
-                    },
-                }
-            );
+            if (buttons.length === 0) {
+                await ctx
+                    .reply(
+                        `<b><u>🎓 Профили не найдены</u></b>\n\nПо вашему запросу "${user_name}" профили не найдены. Попробуйте еще раз или напишите @artem2584 для помощи.`,
+                        {
+                            parse_mode: "HTML",
+                            reply_markup: {
+                                inline_keyboard: [[{ text: "❌ Отмена", callback_data: "reset_listeners" }]],
+                            },
+                        }
+                    )
+                    .catch((e) => Logger.errorMessage(`Error replying no profiles found: ${e.message}`));
+            } else {
+                await ctx
+                    .reply(
+                        `<b><u>🎓 Выбери свой профиль</u></b>\n\nНайдено профилей: <b>${search_results.length}</b> (показано макс. 5).\nЕсли нет твоего профиля, попробуй уточнить ФИО или напиши @artem2584.`,
+                        {
+                            parse_mode: "HTML",
+                            reply_markup: {
+                                inline_keyboard: [
+                                    ...buttons,
+                                    [{ text: "❌ Отмена", callback_data: "reset_listeners" }],
+                                ],
+                            },
+                        }
+                    )
+                    .catch((e) => Logger.errorMessage(`Error replying with profiles: ${e.message}`));
+            }
+        } catch (e) {
+            Logger.errorMessage(`Error in modeus_listener textHandler: ${e.message} ${e.stack}`);
+            await ctx
+                .reply("Произошла ошибка при поиске. Попробуйте позже.")
+                .catch((e) => Logger.errorMessage(`Error replying search error: ${e.message}`));
         }
-        executeLogic();
     });
 
     bot.action(/modeus_(.+)/, async (ctx) => {
         const profile_id = ctx.match[1];
-        await ctx.answerCbQuery();
+        await ctx.answerCbQuery().catch(() => {});
         user_states.set(ctx.from.id, "none");
 
         await db.saveUserModeus(ctx.from.id, profile_id);
 
-        await ctx.editMessageText(
-            `<b><u>🎓 Профиль Modeus привязан!</u></b>\n\nТы успешно привязал свой профиль.\nID твоего профиля: <code>${profile_id}</code>`,
-            { parse_mode: "HTML" }
-        );
+        await ctx
+            .editMessageText(
+                `<b><u>🎓 Профиль Modeus привязан!</u></b>\n\nТы успешно привязал свой профиль.\nID твоего профиля: <code>${profile_id}</code>`,
+                { parse_mode: "HTML" }
+            )
+            .catch((e) => Logger.errorMessage(`Error editing modeus linked message: ${e.message}`));
     });
 }
 
 function registerGoogleSync() {
     bot.command("link_google", (ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
 
         let issue_time = Math.floor(new Date().getTime() / 1000);
+        // Using your original crypto.hash
         let state = `${ctx.from.id}-${issue_time}-${crypto.hash(
             "sha256",
             `${ctx.from.id}-${issue_time}-${config.credentials.internal}`
@@ -990,15 +1070,16 @@ function registerGoogleSync() {
             access_type: "offline",
             scope: [
                 "https://www.googleapis.com/auth/calendar.app.created",
+                "https://www.googleapis.com/auth/calendar.events",
             ],
             state: state,
-            prompt: "consent", // Force consent screen to ensure refresh_token on re-auth if needed
+            prompt: "consent",
         });
 
         ctx.reply(
-            `<b><u>📅 Подключение Google Calendar</u></b>\n\n❗ Добавлю новый календарь только для событий из Modeus.\nВсё будет работать точно также, но твои события не будут перезаписаны.\nЕсли не получается привязать аккаунт, напиши @artem2584\n\n<a href="${url}">Перейди по ссылке, чтобы привязать аккаунт.</a>`,
-            { parse_mode: "HTML" }
-        );
+            `<b><u>📅 Подключение Google Calendar</u></b>\n\n❗ Бот создаст новый календарь "Modeus Integration" в вашем Google Аккаунте и будет управлять только им.\nВаши существующие календари и события затронуты не будут.\n\n<a href="${url}">➡️ Перейди по этой ссылке, чтобы разрешить доступ.</a>\n\nЕсли не получается привязать аккаунт, напиши @artem2584`,
+            { parse_mode: "HTML", disable_web_page_preview: true }
+        ).catch((e) => Logger.errorMessage(`Error sending link_google prompt: ${e.message}`));
     });
 
     setInterval(async () => {
@@ -1024,21 +1105,27 @@ function registerGoogleSync() {
                     Logger.errorMessage(
                         `Failed to get refresh_token for tg_id ${tg_id}. Tokens: ${JSON.stringify(tokens)}`
                     );
-                    await bot.telegram.sendMessage(
-                        tg_id,
-                        `❌ Не удалось привязать Google! Попробуй привязать ещё раз через /link_google.\nЕсли проблема повторяется, напиши @artem2584.`
-                    );
+                    await bot.telegram
+                        .sendMessage(
+                            tg_id,
+                            `❌ Не удалось привязать Google! Попробуй привязать ещё раз через /link_google.\nЕсли проблема повторяется, напиши @artem2584.`
+                        )
+                        .catch((e) => Logger.errorMessage(`Error sending TG message (no refresh token): ${e.message}`));
                     continue;
                 }
                 await db.saveUserGoogleCalendar(tg_id, tokens.refresh_token);
                 Logger.infoMessage(`Successfully obtained and saved refresh_token for tg_id ${tg_id}.`);
-                await bot.telegram.sendMessage(
-                    tg_id,
-                    `✅ Google Calendar был успешно привязан! Расписание начнет синхронизироваться в течение 15-30 минут.`
-                );
+                await bot.telegram
+                    .sendMessage(
+                        tg_id,
+                        `✅ Google Calendar был успешно привязан! Расписание начнет синхронизироваться в течение 15-30 минут.`
+                    )
+                    .catch((e) => Logger.errorMessage(`Error sending TG message (success link): ${e.message}`));
             } catch (err) {
                 Logger.errorMessage(
-                    `Error exchanging Google token for tg_id ${tg_id}: ${err.message}.`
+                    `Error exchanging Google token for tg_id ${tg_id}: ${err.message}. Code used: ${
+                        code ? code.substring(0, 20) + "..." : "N/A"
+                    }`
                 );
                 await db.deleteLoginAttempts(tg_id);
                 let userMessage = `❌ Ошибка при привязке Google Calendar: ${err.message}.\nПопробуй еще раз через /link_google.`;
@@ -1048,10 +1135,12 @@ function registerGoogleSync() {
                 ) {
                     userMessage = `❌ Ошибка: код авторизации уже использован или недействителен. Пожалуйста, сгенерируй новую ссылку через /link_google и используй ее сразу.`;
                 }
-                await bot.telegram.sendMessage(tg_id, userMessage + `\nЕсли не получится, напиши @artem2584.`);
+                await bot.telegram
+                    .sendMessage(tg_id, userMessage + `\nЕсли не получится, напиши @artem2584.`)
+                    .catch((e) => Logger.errorMessage(`Error sending TG message (token exchange error): ${e.message}`));
             }
         }
-    }, 15 * 1000); // Check every 15 seconds
+    }, 15 * 1000);
 }
 
 // Launch the bot
@@ -1061,6 +1150,7 @@ bot.launch()
     })
     .catch((err) => {
         Logger.errorMessage(`Bot launch error: ${err.message}`);
+        process.exit(1);
     });
 
 // Enable graceful stop

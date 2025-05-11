@@ -20,5 +20,6 @@ module.exports = {
         client_id: process.env.GOOGLE_CLIENT_ID,
         secret_id: process.env.GOOGLE_SECRET_ID,
         redirect: process.env.GOOGLE_REDIRECT
-    }
+    },
+    admin: process.env.ADMIN_ID,
 };

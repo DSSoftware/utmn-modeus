@@ -10,5 +10,8 @@ module.exports = {
     },
     infoMessage(message){
         console.log(chalk.inverse` Info ` + ` ${message}`);
+    },
+    warnMessage(message){
+        console.log(chalk.bgYellowBright` Warning ` + ` ${message}`);
     }
 };

@@ -15,5 +15,8 @@
     "googleapis": "^148.0.0",
     "mysql2": "^3.13.0",
     "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "gbatchrequests": "^1.0.0"
   }
 }

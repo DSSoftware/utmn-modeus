@@ -371,60 +371,105 @@ async function findModeusEvents(attendees) {
         for (const course of request.data._embedded["cycle-realizations"]) {
             courses.set(course.id, course);
         }
-        let threads = 5;
 
+        let threads = 5;
         let promises = [];
 
         for (let thread = 0; thread < threads; thread++) {
             promises.push(
                 new Promise(async (resolve, reject) => {
                     for (let i = thread; i < events.length; i += threads) {
-                        let place_info = "";
+                        try {
+                            let place_info = "";
 
-                        if (event_locations[i].customLocation != null) {
-                            place_info = event_locations[i].customLocation;
-                        } else {
-                            let location = location_map.get(event_locations[i]._links["event-rooms"].href.substring(1));
-                            let room = rooms.get(location._links.room.href.substring(1));
-
-                            place_info = room.nameShort;
-                        }
-
-                        let course_name = courses.get(
-                            events[i]._links["cycle-realization"].href.substring(1)
-                        ).courseUnitRealizationNameShort;
-
-                        let event_attendees = await getEventAttendees(events[i].id);
-                        let attendees_list = [];
-                        let teachers = [];
-                        for (let event_attendee of event_attendees) {
-                            attendees_list.push(event_attendee.personId);
-                            if (event_attendee.roleId != "STUDENT") {
-                                teachers.push(event_attendee.fullName);
+                            if (event_locations[i].customLocation != null) {
+                                place_info = event_locations[i].customLocation;
+                            } else {
+                                let location = location_map.get(
+                                    event_locations[i]._links["event-rooms"].href.substring(1)
+                                );
+                                let room = rooms.get(location._links.room.href.substring(1));
+                                place_info = room.nameShort;
                             }
+
+                            let course_name = courses.get(
+                                events[i]._links["cycle-realization"].href.substring(1)
+                            ).courseUnitRealizationNameShort;
+
+                            let event_attendees_data = await getEventAttendees(events[i].id);
+                            let attendees_list = [];
+                            let teachers = [];
+                            for (let event_attendee of event_attendees_data) {
+                                attendees_list.push(event_attendee.personId);
+                                if (event_attendee.roleId != "STUDENT") {
+                                    teachers.push(event_attendee.fullName);
+                                }
+                            }
+
+                            let event_data = {
+                                info: events[i],
+                                room_name: place_info,
+                                course: course_name,
+                                attendee_list: attendees_list,
+                                teachers: teachers,
+                            };
+                            prep_events.push(event_data);
+                        } catch (innerError) {
+                            Logger.errorMessage(
+                                `Error processing event detail for event ID ${events[i]?.id} in findModeusEvents: ${innerError.message}`
+                            );
                         }
-
-                        let event_data = {
-                            info: events[i],
-                            room_name: place_info,
-                            course: course_name,
-                            attendee_list: attendees_list,
-                            teachers: teachers,
-                        };
-                        prep_events.push(event_data);
                     }
-
                     resolve(true);
                 })
             );
         }
-
         await Promise.all(promises);
-
         return prep_events;
     } catch (e) {
         console.log(e);
         return [];
+    }
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function callGoogleApiWithRetry(apiCallFunction, logContext = "", maxRetries = 5, initialDelayMs = 1000) {
+    let attempt = 0;
+    let currentDelayMs = initialDelayMs;
+    while (attempt < maxRetries) {
+        try {
+            return await apiCallFunction();
+        } catch (error) {
+            const isRateLimitError =
+                error.code === 429 ||
+                (error.code === 403 &&
+                    error.errors &&
+                    error.errors.some((e) => e.reason === "rateLimitExceeded" || e.reason === "userRateLimitExceeded"));
+
+            const isServiceUnavailable = error.code === 503;
+
+            if ((isRateLimitError || isServiceUnavailable) && attempt < maxRetries - 1) {
+                Logger.warnMessage(
+                    `${
+                        isRateLimitError ? "Rate limit" : "Service unavailable"
+                    } encountered for ${logContext}. Retrying in ${currentDelayMs / 1000}s... (Attempt ${
+                        attempt + 1
+                    }/${maxRetries})`
+                );
+                await delay(currentDelayMs + Math.random() * 1000);
+                currentDelayMs *= 2;
+                if (currentDelayMs > 60000) currentDelayMs = 60000;
+                attempt++;
+            } else {
+                Logger.errorMessage(
+                    `Final error for ${logContext} after ${attempt + 1} attempts: ${error.message} (Code: ${
+                        error.code
+                    })`
+                );
+                throw error;
+            }
+        }
     }
 }
 
@@ -444,7 +489,7 @@ async function init() {
     async function recheckModeus() {
         Logger.infoMessage("Rechecking Modeus Events...");
         let attendees = [];
-        let recheck_started = Math.floor(new Date().getTime() / 1000);
+        let recheck_started_modeus = Math.floor(new Date().getTime() / 1000);
 
         let students_stat = 0;
         let events_stat = 0;
@@ -452,49 +497,42 @@ async function init() {
         async function fetchAssociatedEvents(attendee_list) {
             let events = await findModeusEvents(attendee_list);
 
-            let promises = [];
-            let threads = 10;
-            for (let thread = 0; thread < threads; thread++) {
-                promises.push(
-                    new Promise(async (resolve, reject) => {
-                        for (let i = thread; i < events.length; i += threads) {
-                            const event = events[i];
-                            events_stat++;
-                            let event_object = {
-                                id: event.info.id,
-                                name: event.info.name,
-                                typeId: event.info.typeId,
-                                start: event.info.startsAt,
-                                end: event.info.endsAt,
-                                room: event.room_name,
-                                course: event.course,
-                                attendees: event.attendee_list,
-                                teachers: event.teachers,
-                            };
+            let db_save_promises = [];
+            for (const event of events) {
+                events_stat++;
+                let event_object = {
+                    id: event.info.id,
+                    name: event.info.name,
+                    typeId: event.info.typeId,
+                    start: event.info.startsAt,
+                    end: event.info.endsAt,
+                    room: event.room_name,
+                    course: event.course,
+                    attendees: event.attendee_list,
+                    teachers: event.teachers,
+                };
 
-                            let timestamp = new Date(event.info.startsAt).getTime() / 1000;
+                let timestamp = new Date(event.info.startsAt).getTime() / 1000;
 
-                            for (const attendee of attendee_list) {
-                                if (!event_object.attendees.includes(attendee)) {
-                                    continue;
-                                }
-                                await db.saveUserEvent(
-                                    `${attendee};${event.info.id}`,
-                                    attendee,
-                                    event.info.id,
-                                    recheck_started,
-                                    timestamp
-                                );
-                            }
-
-                            await db.saveEvent(event.info.id, recheck_started, timestamp, JSON.stringify(event_object));
-                        }
-                        resolve(true);
-                    })
+                for (const attendee_id of attendee_list) {
+                    if (!event_object.attendees.includes(attendee_id)) {
+                        continue;
+                    }
+                    db_save_promises.push(
+                        db.saveUserEvent(
+                            `${attendee_id};${event.info.id}`,
+                            attendee_id,
+                            event.info.id,
+                            recheck_started_modeus,
+                            timestamp
+                        )
+                    );
+                }
+                db_save_promises.push(
+                    db.saveEvent(event.info.id, recheck_started_modeus, timestamp, JSON.stringify(event_object))
                 );
             }
-
-            await Promise.all(promises);
+            await Promise.all(db_save_promises);
         }
 
         let students = db.getRecheckUsers();
@@ -513,182 +551,284 @@ async function init() {
         }
 
         Logger.successMessage("Rechecked Modeus Events.");
-        await db.setConfigValue("lastRefresh", recheck_started);
+        await db.setConfigValue("lastRefresh", recheck_started_modeus);
 
-        console.log(`Recheck Stats:\nStudents: ${students_stat}\nEvents: ${events_stat}`);
-        console.log(`Recheck Time: ${Math.floor(new Date().getTime() / 1000) - recheck_started} seconds`);
+        console.log(`Modeus Recheck Stats:\nStudents: ${students_stat}\nEvents: ${events_stat}`);
+        console.log(`Modeus Recheck Time: ${Math.floor(new Date().getTime() / 1000) - recheck_started_modeus} seconds`);
 
         let monday_timestamp = Math.floor(getDates().start_timestamp / 1000);
 
-        await db.cleanupOldEvents(monday_timestamp, recheck_started);
-        await db.cleanupOldStudentEvents(monday_timestamp, recheck_started);
+        await db.cleanupOldEvents(monday_timestamp, recheck_started_modeus);
+        await db.cleanupOldStudentEvents(monday_timestamp, recheck_started_modeus);
 
         /*
             Handle Google Calendar Here
         */
 
         Logger.infoMessage("Syncing with Google Calendar...");
-        recheck_started = Math.floor(new Date().getTime() / 1000);
+        let google_sync_start_time = Math.floor(new Date().getTime() / 1000);
+        const GOOGLE_API_BATCH_SIZE = 50;
 
         let logged_attendees = db.getLoggedAttendees();
 
-        const calendarOAuth = new google.auth.OAuth2(
+        const calendarOAuthInstance = new google.auth.OAuth2(
             config.google.client_id,
             config.google.secret_id,
             config.google.redirect
         );
 
         for await (const calendar_attendee of logged_attendees) {
+            let ca_id = calendar_attendee.attendee_id;
+            Logger.infoMessage(`Starting Google Calendar sync for user ${ca_id}`);
             try {
-                let ca_id = calendar_attendee.attendee_id;
-                let calendar_events = await db.getUserEvents(ca_id);
-                let calendar_person = (await db.findAttendee(ca_id))[0];
+                let calendar_events_to_sync = await db.getUserEvents(ca_id);
+                let calendar_person_array = await db.findAttendee(ca_id);
 
-                calendarOAuth.setCredentials({
+                if (!calendar_person_array || calendar_person_array.length === 0) {
+                    Logger.errorMessage(`Calendar person not found for attendee ID: ${ca_id}. Skipping.`);
+                    continue;
+                }
+                let calendar_person = calendar_person_array[0];
+
+                if (!calendar_person.google_token) {
+                    Logger.infoMessage(`User ${ca_id} has no Google token. Skipping Google Calendar sync.`);
+                    continue;
+                }
+
+                calendarOAuthInstance.setCredentials({
                     refresh_token: calendar_person.google_token,
                 });
-                const calendar = google.calendar({ version: "v3", auth: calendarOAuth });
+                const calendar = google.calendar({ version: "v3", auth: calendarOAuthInstance });
 
                 let app_calendar_id = calendar_person.calendar_id;
 
                 try {
                     if (app_calendar_id == null) {
-                        throw {
-                            code: 404,
-                            message: "Calendar not created",
-                        };
+                        Logger.infoMessage(`No app_calendar_id stored for user ${ca_id}. Will attempt to create one.`);
+                        throw { code: 404, message: "Calendar not created locally" };
                     }
-                    let response = await calendar.calendars.get({ calendarId: app_calendar_id });
+                    await callGoogleApiWithRetry(
+                        () => calendar.calendars.get({ calendarId: app_calendar_id }),
+                        `get calendar ${app_calendar_id} for user ${ca_id}`
+                    );
+                    Logger.infoMessage(`Calendar ${app_calendar_id} verified for user ${ca_id}`);
                 } catch (e) {
                     if (e.code === 404) {
-                        await db.saveCalendarID(calendar_person.telegram_id, null);
-                        app_calendar_id = null;
+                        Logger.infoMessage(
+                            `Calendar ID ${app_calendar_id || "N/A"} not found for user ${ca_id}. Creating a new one.`
+                        );
+                        try {
+                            const newCalendarResponse = await callGoogleApiWithRetry(
+                                () =>
+                                    calendar.calendars.insert({
+                                        requestBody: {
+                                            summary: "Modeus Integration",
+                                            timeZone: "Asia/Yekaterinburg",
+                                        },
+                                    }),
+                                `insert calendar for user ${ca_id}`
+                            );
+                            app_calendar_id = newCalendarResponse.data.id;
+                            await db.saveCalendarID(calendar_person.telegram_id, app_calendar_id);
+                            Logger.infoMessage(`Created new calendar ${app_calendar_id} for user ${ca_id}`);
+                        } catch (createError) {
+                            Logger.errorMessage(
+                                `Failed to create new calendar for user ${ca_id}: ${createError.message}. Skipping user.`
+                            );
+                            continue;
+                        }
                     } else {
-                        throw e;
+                        Logger.errorMessage(
+                            `Error fetching/verifying calendar for user ${ca_id}: ${e.message}. Skipping user.`
+                        );
+                        continue;
                     }
                 }
 
                 if (!app_calendar_id) {
-                    const newCalendarResponse = await calendar.calendars.insert({
-                        requestBody: {
-                            summary: "Modeus Integration",
-                            timeZone: "Asia/Yekaterinburg",
-                        },
-                    });
-
-                    app_calendar_id = newCalendarResponse.data.id;
-                    await db.saveCalendarID(calendar_person.telegram_id, app_calendar_id);
+                    Logger.errorMessage(
+                        `app_calendar_id is null for user ${ca_id} even after creation attempt. Skipping user.`
+                    );
+                    continue;
                 }
-                let promises = [];
-                let threads = 1;
-                for (let thread = 0; thread < threads; thread++) {
-                    promises.push(
-                        new Promise(async (resolve, reject) => {
-                            for (let i = thread; i < calendar_events.length; i += threads) {
-                                const calendar_event = calendar_events[i];
-                                try {
-                                    let event_id = calendar_event.event_id;
-                                    let event_record = await db.getEvent(event_id);
-            
-                                    let event_data = JSON.parse(event_record[0].event_data);
-            
-                                    let sas_event = event_data.name.match(/\d.\d/g);
-            
-                                    let event_name = `${event_data.name} / ${event_data.course}`;
-                                    let type = event_data.typeId === "LECT" ? "L" : "S";
-                                    let color = event_data.typeId === "LECT" ? 10 : 1;
-            
-                                    if (sas_event != null) {
-                                        event_name = `${sas_event}${type} / ${event_data.course}`;
-                                    }
-            
-                                    let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
-                                    let attendee_teachers = [];
-            
-                                    /*for (const teacher of event_data.teachers) {
-                                        attendee_teachers.push({
-                                            displayName: teacher,
-                                            email: "modeus_integration@dssoftware.ru"
-                                        });
-                                    }*/
-            
-                                    const eventResource = {
-                                        summary: event_name,
-                                        description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${
-                                            event_data.attendees.length - event_data.teachers.length
-                                        } участников\n\n${professor_list}`,
-                                        start: {
-                                            dateTime: event_data.start, // RFC3339
-                                            timeZone: "Asia/Yekaterinburg",
-                                        },
-                                        end: {
-                                            dateTime: event_data.end, // RFC3339
-                                            timeZone: "Asia/Yekaterinburg",
-                                        },
-                                        location: event_data.room,
-                                        attendees: attendee_teachers,
-                                        colorId: color,
-                                    };
-            
-                                    async function createCalendarEvent() {
-                                        const storedGoogleEvents = await db.findCalendarEvent(event_id);
-            
-                                        let storedGoogleEventId = null;
-                                        if (storedGoogleEvents.length != 0) {
-                                            storedGoogleEventId = storedGoogleEvents[0].calendar_id;
-                                        }
-            
-                                        if (storedGoogleEventId) {
-                                            try {
-                                                const updatedEvent = await calendar.events.update({
-                                                    calendarId: app_calendar_id,
-                                                    eventId: storedGoogleEventId,
-                                                    requestBody: eventResource,
-                                                });
-                                                return storedGoogleEventId;
-                                            } catch (error) {
-                                                if (error.code === 404 || (error.response && error.response.status === 404)) {
-                                                    await db.deleteCalendarEvent(event_id);
-                                                } else if (error.code === 410) {
-                                                    await db.deleteCalendarEvent(event_id);
-                                                } else {
-                                                    throw error;
-                                                }
-                                            }
-                                        }
-            
-                                        try {
-                                            const createdEvent = await calendar.events.insert({
-                                                calendarId: app_calendar_id,
-                                                requestBody: eventResource,
-                                            });
-            
-                                            return createdEvent.data.id;
-                                        } catch (error) {
-                                            throw error;
-                                        }
-                                    }
-            
-                                    let timestamp = new Date(event_data.start).getTime() / 1000;
-                                    let google_event_id = await createCalendarEvent();
-                                    await db.saveCalendarEvent(event_id, google_event_id, timestamp);
-                                } catch (e) {
-                                    console.log(e);
-                                }
+
+                Logger.infoMessage(
+                    `Processing ${calendar_events_to_sync.length} events for user ${ca_id} in calendar ${app_calendar_id}`
+                );
+
+                const eventChunks = [];
+                for (let i = 0; i < calendar_events_to_sync.length; i += GOOGLE_API_BATCH_SIZE) {
+                    eventChunks.push(calendar_events_to_sync.slice(i, i + GOOGLE_API_BATCH_SIZE));
+                }
+
+                for (let chunkIndex = 0; chunkIndex < eventChunks.length; chunkIndex++) {
+                    const chunk = eventChunks[chunkIndex];
+                    const batch = calendar.batch({ path: "batch/calendar/v3" });
+                    let dbOperationsPromises = [];
+                    let operationsInBatch = 0;
+
+                    Logger.infoMessage(
+                        `User ${ca_id}: Processing event chunk ${chunkIndex + 1}/${eventChunks.length} with ${
+                            chunk.length
+                        } events.`
+                    );
+
+                    for (const calendar_event of chunk) {
+                        try {
+                            let modeus_event_id = calendar_event.event_id;
+                            let event_record_array = await db.getEvent(modeus_event_id);
+
+                            if (
+                                !event_record_array ||
+                                event_record_array.length === 0 ||
+                                !event_record_array[0] ||
+                                !event_record_array[0].event_data
+                            ) {
+                                Logger.warnMessage(
+                                    `Event data not found or invalid for DB event_id: ${modeus_event_id} (user ${ca_id}). Skipping this event in batch.`
+                                );
+                                continue;
                             }
-                            setTimeout(resolve, 100);
-                        })
-                    )
-                }
-                
-                await Promise.all(promises);
-            } catch (e) {
-                console.log(e);
-            }
-        }
+                            let event_data = JSON.parse(event_record_array[0].event_data);
+                            let event_timestamp = new Date(event_data.start).getTime() / 1000;
 
-        Logger.successMessage("Reassigned Google Calendar Events.");
-        console.log(`Google Time: ${Math.floor(new Date().getTime() / 1000) - recheck_started} seconds`);
+                            let sas_event = event_data.name.match(/\d.\d/g);
+                            let event_name = `${event_data.name} / ${event_data.course}`;
+                            let type = event_data.typeId === "LECT" ? "L" : "S";
+                            let color = event_data.typeId === "LECT" ? "10" : "1";
+
+                            if (sas_event != null) event_name = `${sas_event}${type} / ${event_data.course}`;
+                            let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
+
+                            const eventResource = {
+                                summary: event_name,
+                                description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${
+                                    event_data.attendees.length - event_data.teachers.length
+                                } участников\n\n${professor_list}`,
+                                start: { dateTime: event_data.start, timeZone: "Asia/Yekaterinburg" },
+                                end: { dateTime: event_data.end, timeZone: "Asia/Yekaterinburg" },
+                                location: event_data.room,
+                                colorId: color,
+                            };
+
+                            const storedGoogleEvents = await db.findCalendarEvent(modeus_event_id);
+                            let storedGoogleEventId =
+                                storedGoogleEvents.length > 0 && storedGoogleEvents[0].calendar_id
+                                    ? storedGoogleEvents[0].calendar_id
+                                    : null;
+
+                            const callback = (err, res) => {
+                                if (err) {
+                                    Logger.errorMessage(
+                                        `Batch operation error for Modeus Event ${modeus_event_id} (User ${ca_id}): ${err.message} (Code: ${err.code})`
+                                    );
+                                    // If a 404 on update, try to delete local and it might get inserted next time or in a retry of the whole batch
+                                    if (err.code === 404 && storedGoogleEventId) {
+                                        // If it was an update that failed with 404
+                                        Logger.warnMessage(
+                                            `Google Event ${storedGoogleEventId} (Modeus ${modeus_event_id}) not found during batch update. Deleting local association.`
+                                        );
+                                        dbOperationsPromises.push(
+                                            db
+                                                .deleteCalendarEvent(modeus_event_id)
+                                                .catch((delErr) =>
+                                                    Logger.errorMessage(
+                                                        `Failed to delete local calendar event ${modeus_event_id} after 404: ${delErr.message}`
+                                                    )
+                                                )
+                                        );
+                                    }
+                                } else if (res && res.data && res.data.id) {
+                                    Logger.infoMessage(
+                                        `Batch operation success for Modeus Event ${modeus_event_id} (User ${ca_id}). Google Event ID: ${res.data.id}`
+                                    );
+                                    dbOperationsPromises.push(
+                                        db
+                                            .saveCalendarEvent(modeus_event_id, res.data.id, event_timestamp)
+                                            .catch((saveErr) =>
+                                                Logger.errorMessage(
+                                                    `Failed to save Google Event ID ${res.data.id} for Modeus ${modeus_event_id}: ${saveErr.message}`
+                                                )
+                                            )
+                                    );
+                                } else {
+                                    Logger.warnMessage(
+                                        `Batch operation for Modeus Event ${modeus_event_id} (User ${ca_id}) completed with no error but no response data/ID.`
+                                    );
+                                }
+                            };
+
+                            if (storedGoogleEventId) {
+                                batch.add(
+                                    {
+                                        method: "PUT",
+                                        path: `/calendar/v3/calendars/${app_calendar_id}/events/${storedGoogleEventId}`,
+                                        body: eventResource,
+                                    },
+                                    callback
+                                );
+                                operationsInBatch++;
+                            } else {
+                                batch.add(
+                                    {
+                                        method: "POST",
+                                        path: `/calendar/v3/calendars/${app_calendar_id}/events`,
+                                        body: eventResource,
+                                    },
+                                    callback
+                                );
+                                operationsInBatch++;
+                            }
+                        } catch (prepError) {
+                            Logger.errorMessage(
+                                `Error preparing event ${calendar_event.event_id} for batch (User ${ca_id}): ${prepError.message}`
+                            );
+                        }
+                    }
+
+                    if (operationsInBatch > 0) {
+                        Logger.infoMessage(
+                            `User ${ca_id}: Executing batch with ${operationsInBatch} operations for chunk ${
+                                chunkIndex + 1
+                            }.`
+                        );
+                        try {
+                            await callGoogleApiWithRetry(
+                                () => batch.execute(),
+                                `execute batch for user ${ca_id}, chunk ${chunkIndex + 1}`
+                            );
+
+                            await Promise.all(dbOperationsPromises);
+                            Logger.infoMessage(
+                                `User ${ca_id}: Batch chunk ${chunkIndex + 1} processed, including DB updates.`
+                            );
+                        } catch (batchExecuteError) {
+                            Logger.errorMessage(
+                                `User ${ca_id}: Critical error executing batch chunk ${chunkIndex + 1}: ${
+                                    batchExecuteError.message
+                                }`
+                            );
+                        }
+                    } else {
+                        Logger.infoMessage(
+                            `User ${ca_id}: No operations to execute in batch for chunk ${chunkIndex + 1}.`
+                        );
+                    }
+                    await delay(1000); // Delay between batches for the same user
+                } // end of for...of eventChunks
+                Logger.infoMessage(`Finished Google Calendar sync for user ${ca_id}`);
+                await delay(1000); // Delay between users
+            } catch (userProcessingError) {
+                Logger.errorMessage(
+                    `Overall error processing Google Calendar for user ${ca_id}: ${userProcessingError.message} ${userProcessingError.stack}`
+                );
+            }
+        } // End of for await...of logged_attendees
+
+        Logger.successMessage("Finished syncing all users with Google Calendar.");
+        console.log(
+            `Google Sync Total Time: ${Math.floor(new Date().getTime() / 1000) - google_sync_start_time} seconds`
+        );
     }
 }
 
@@ -707,7 +847,7 @@ bot.hears(/^(?!\/).*$/, (ctx) => {
 bot.action(/reset_listeners/, async (ctx) => {
     await ctx.answerCbQuery();
     user_states.set(ctx.from.id, "none");
-    await ctx.deleteMessage(ctx.callbackQuery?.message?.message_id);
+    ctx.deleteMessage(ctx.callbackQuery?.message?.message_id).catch(()=>{});;
 });
 
 init();
@@ -727,7 +867,7 @@ function registerInfoCommands() {
 
     bot.command("info", (ctx) => {
         (async () => {
-            ctx.deleteMessage(ctx.message.message_id);
+            ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
 
             let user_info = await db.getUserInfo(ctx.from.id);
 
@@ -748,8 +888,7 @@ function registerInfoCommands() {
             let last_refresh = await db.getConfigValue("lastRefresh");
             let relative_refresh = "никогда";
             if (last_refresh.length == 1) {
-                console.log(last_refresh[0].value);
-                let rd = new Date((last_refresh[0].value * 1000) + (5 * 60 * 60 * 1000));
+                let rd = new Date(last_refresh[0].value * 1000 + 5 * 60 * 60 * 1000);
 
                 relative_refresh = `${day(rd)}.${month(rd)}.${year(rd)} ${hour(rd)}:${minute(rd)}`;
             }
@@ -759,7 +898,7 @@ function registerInfoCommands() {
                     linked_modeus ? "✅ Привязан" : "❌ Не привязан"
                 }</b>\nПрофиль Google: <b>${linked_google ? "✅ Привязан" : "❌ Не привязан"}</b>\n\nНастройка: <b>${
                     can_refresh ? "✅ Готово к работе" : "❌ Один из профилей не привязан"
-                }</b>\n\n<u>🔁 Последнее обновление</u>\nСписок событий обновлён <u>${relative_refresh}</u>`,
+                }</b>\n\n<u>🔁 Последнее обновление</u>\nСписок событий Modeus обновлён <u>${relative_refresh}</u> (UTC+5)`,
                 {
                     parse_mode: "HTML",
                 }
@@ -768,19 +907,19 @@ function registerInfoCommands() {
     });
 
     bot.start((ctx) => {
-        ctx.deleteMessage(ctx.message.message_id);
+        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
         sendHelpDialog(ctx);
     });
 
     bot.help((ctx) => {
-        ctx.deleteMessage(ctx.message.message_id);
+        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
         sendHelpDialog(ctx);
     });
 }
 
 function registerModeusSync() {
     bot.command("link_modeus", (ctx) => {
-        ctx.deleteMessage(ctx.message.message_id);
+        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
         ctx.reply(
             `<b><u>🎓 Подключение Modeus</u></b>\n\nВведи полное ФИО в таком порядке:\n<code>Иванов Иван Иванович</code>`,
             {
@@ -794,11 +933,10 @@ function registerModeusSync() {
     });
 
     textHandlers.push(async (ctx) => {
+        if (user_states.get(ctx.from.id) != "modeus_listener") {
+            return;
+        }
         async function executeLogic() {
-            if (user_states.get(ctx.from.id) != "modeus_listener") {
-                return;
-            }
-
             let user_name = ctx.message.text;
             let search_results = await findModeusUser(user_name);
 
@@ -827,24 +965,22 @@ function registerModeusSync() {
     bot.action(/modeus_(.+)/, async (ctx) => {
         const profile_id = ctx.match[1];
         await ctx.answerCbQuery();
+        user_states.set(ctx.from.id, "none");
 
         await db.saveUserModeus(ctx.from.id, profile_id);
 
-        ctx.reply(
+        await ctx.editMessageText(
             `<b><u>🎓 Профиль Modeus привязан!</u></b>\n\nТы успешно привязал свой профиль.\nID твоего профиля: <code>${profile_id}</code>`,
-            {
-                parse_mode: "HTML",
-            }
+            { parse_mode: "HTML" }
         );
     });
 }
 
 function registerGoogleSync() {
     bot.command("link_google", (ctx) => {
-        ctx.deleteMessage(ctx.message.message_id);
+        ctx.deleteMessage(ctx.message.message_id).catch(()=>{});
 
         let issue_time = Math.floor(new Date().getTime() / 1000);
-
         let state = `${ctx.from.id}-${issue_time}-${crypto.hash(
             "sha256",
             `${ctx.from.id}-${issue_time}-${config.credentials.internal}`
@@ -852,66 +988,89 @@ function registerGoogleSync() {
 
         const url = googleOAuth.generateAuthUrl({
             access_type: "offline",
-            scope: "https://www.googleapis.com/auth/calendar.app.created",
+            scope: [
+                "https://www.googleapis.com/auth/calendar.app.created",
+            ],
             state: state,
+            prompt: "consent", // Force consent screen to ensure refresh_token on re-auth if needed
         });
 
         ctx.reply(
             `<b><u>📅 Подключение Google Calendar</u></b>\n\n❗ Добавлю новый календарь только для событий из Modeus.\nВсё будет работать точно также, но твои события не будут перезаписаны.\nЕсли не получается привязать аккаунт, напиши @artem2584\n\n<a href="${url}">Перейди по ссылке, чтобы привязать аккаунт.</a>`,
-            {
-                parse_mode: "HTML",
-            }
+            { parse_mode: "HTML" }
         );
     });
 
     setInterval(async () => {
         let login_attempts = await db.getGoogleLoginAttempts();
+        if (login_attempts.length === 0) return;
 
+        Logger.infoMessage(`Processing ${login_attempts.length} Google login attempts.`);
         for (const login_attempt of login_attempts) {
             let tg_id = login_attempt.tg_id;
             let code = login_attempt.code;
 
-            googleOAuth.getToken(code, async (err, tokens) => {
-                try {
-                    await db.deleteLoginAttempts(tg_id);
-                    if (err || tokens?.refresh_token == undefined) {
-                        await bot.telegram.sendMessage(
-                            tg_id,
-                            `❌ Не удалось привязать Google! Попробуй привязать ещё раз с новой ссылкой.\nЕсли не получится, напиши @artem2584`
-                        );
-                        return;
-                    }
+            let attempt_googleOAuth = new google.auth.OAuth2(
+                config.google.client_id,
+                config.google.secret_id,
+                config.google.redirect
+            );
 
-                    let refresh_token = tokens.refresh_token;
+            try {
+                const { tokens } = await attempt_googleOAuth.getToken(code);
+                await db.deleteLoginAttempts(tg_id);
 
-                    await db.saveUserGoogleCalendar(tg_id, refresh_token);
-
-                    await bot.telegram.sendMessage(tg_id, `✅ Google Calendar был успешно привязан!`);
-                } catch (e) {
-                    console.log(e);
+                if (!tokens || !tokens.refresh_token) {
+                    Logger.errorMessage(
+                        `Failed to get refresh_token for tg_id ${tg_id}. Tokens: ${JSON.stringify(tokens)}`
+                    );
+                    await bot.telegram.sendMessage(
+                        tg_id,
+                        `❌ Не удалось привязать Google! Попробуй привязать ещё раз через /link_google.\nЕсли проблема повторяется, напиши @artem2584.`
+                    );
+                    continue;
                 }
-            });
-        }
-    }, 15 * 1000);
-
-    bot.action(/modeus_(.+)/, async (ctx) => {
-        const profile_id = ctx.match[1];
-        await ctx.answerCbQuery();
-
-        await db.saveUserModeus(ctx.from.id, profile_id);
-
-        ctx.reply(
-            `<b><u>🎓 Профиль Modeus привязан!</u></b>\n\nВы успешно привязали ваш профиль.\nID вашего профиля: <code>${profile_id}</code>`,
-            {
-                parse_mode: "HTML",
+                await db.saveUserGoogleCalendar(tg_id, tokens.refresh_token);
+                Logger.infoMessage(`Successfully obtained and saved refresh_token for tg_id ${tg_id}.`);
+                await bot.telegram.sendMessage(
+                    tg_id,
+                    `✅ Google Calendar был успешно привязан! Расписание начнет синхронизироваться в течение 15-30 минут.`
+                );
+            } catch (err) {
+                Logger.errorMessage(
+                    `Error exchanging Google token for tg_id ${tg_id}: ${err.message}.`
+                );
+                await db.deleteLoginAttempts(tg_id);
+                let userMessage = `❌ Ошибка при привязке Google Calendar: ${err.message}.\nПопробуй еще раз через /link_google.`;
+                if (
+                    err.message &&
+                    (err.message.includes("invalid_grant") || err.message.includes("code has already been used"))
+                ) {
+                    userMessage = `❌ Ошибка: код авторизации уже использован или недействителен. Пожалуйста, сгенерируй новую ссылку через /link_google и используй ее сразу.`;
+                }
+                await bot.telegram.sendMessage(tg_id, userMessage + `\nЕсли не получится, напиши @artem2584.`);
             }
-        );
-    });
+        }
+    }, 15 * 1000); // Check every 15 seconds
 }
 
 // Launch the bot
-bot.launch();
+bot.launch()
+    .then(() => {
+        Logger.successMessage("Bot launched successfully.");
+    })
+    .catch((err) => {
+        Logger.errorMessage(`Bot launch error: ${err.message}`);
+    });
 
 // Enable graceful stop
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+process.once("SIGINT", () => {
+    Logger.infoMessage("SIGINT received, stopping bot...");
+    bot.stop("SIGINT");
+    process.exit(0);
+});
+process.once("SIGTERM", () => {
+    Logger.infoMessage("SIGTERM received, stopping bot...");
+    bot.stop("SIGTERM");
+    process.exit(0);
+});

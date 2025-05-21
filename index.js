@@ -690,6 +690,7 @@ async function recheckModeus() {
                         accessToken: accessToken,
                         requests: currentGetChunk,
                         api: { name: "calendar", version: "v3" },
+                        skipError: true,
                     };
                     try {
                         Logger.infoMessage(
@@ -714,7 +715,7 @@ async function recheckModeus() {
                                 }
 
                                 let isValidAndActive = false;
-                                if (resp.id) {
+                                if (resp?.id) {
                                     if (resp.status === "cancelled") {
                                         Logger.infoMessage(
                                             `User ${user_modeus_id}: Event Modeus ID ${correspondingModeusId} (GCal ID ${fetchedGoogleId}) is 'cancelled' on Google. Will treat as needing new ID.`
@@ -737,7 +738,7 @@ async function recheckModeus() {
                                         `User ${user_modeus_id}: Removed mapping for Modeus ID ${correspondingModeusId} from DB and current sync map.`
                                     );
                                 } else {
-                                    modeusIdToActiveGoogleIdMap.set(correspondingModeusId, resp.result.id);
+                                    modeusIdToActiveGoogleIdMap.set(correspondingModeusId, resp.id);
                                 }
                             }
                         } else {
@@ -748,13 +749,14 @@ async function recheckModeus() {
                             );
                         }
                     } catch (getBatchError) {
+                        console.log(getBatchError);
                         Logger.errorMessage(
                             `User ${user_modeus_id}: Critical error executing GET batch for DB-known events (chunk ${
                                 chunkIndex + 1
                             }). Events in this chunk will be treated as needing new IDs.`
                         );
 
-                        for(const req of currentGetChunk){
+                        for (const req of realGetChunk) {
                             const gId = req.customOperationId;
                             const mId = googleIdToModeusIdForGet.get(gId);
                             if (mId) {
@@ -776,9 +778,7 @@ async function recheckModeus() {
                     event_data = modeusEventDetailsCache.get(modeus_event_id);
                 } else {
                     let event_detail_records = await db.getEvent(modeus_event_id);
-                    if (
-                        event_detail_records[0].event_data
-                    ) {
+                    if (event_detail_records[0].event_data) {
                         event_data = JSON.parse(event_detail_records[0].event_data);
                         modeusEventDetailsCache.set(modeus_event_id, event_data);
                     } else {
@@ -845,6 +845,7 @@ async function recheckModeus() {
                         accessToken: accessToken,
                         requests: currentWriteChunk,
                         api: { name: "calendar", version: "v3" },
+                        skipError: true,
                     };
                     try {
                         Logger.infoMessage(`User ${user_modeus_id}: Executing final PUT/POST batch ${chunkIndex + 1}.`);
@@ -862,7 +863,7 @@ async function recheckModeus() {
                                         new Date(modeusEventDetailsCache.get(opModeusId)?.start).getTime() / 1000
                                     ) || Math.floor(Date.now() / 1000);
                                 const attemptedGoogleId = originalReq.originalGoogleId;
-                                
+
                                 if (resp.id) {
                                     if (originalReq.method === "POST") {
                                         if (resp.id !== attemptedGoogleId) {
@@ -870,7 +871,11 @@ async function recheckModeus() {
                                                 `User ${user_modeus_id}: POST success for Modeus ID ${opModeusId}, but GCal ID mismatch! Expected ${attemptedGoogleId}, got ${resp.id}. Saving actual returned ID.`
                                             );
                                         }
-                                        await db.saveCalendarEvent(`${opModeusId}-${user_modeus_id}`, resp.id, eventTimestamp);
+                                        await db.saveCalendarEvent(
+                                            `${opModeusId}-${user_modeus_id}`,
+                                            resp.id,
+                                            eventTimestamp
+                                        );
                                     }
                                 } else {
                                     const errDetail = resp?.error ||
@@ -952,7 +957,9 @@ textHandlers.push(async (ctx) => {
                 const calendar_single_op = google.calendar({ version: "v3", auth: calendarOAuthInstance });
                 let app_calendar_id = user_details.calendar_id;
 
-                await calendar_single_op.calendars.delete({ calendarId: app_calendar_id }).catch((e) => {console.log(e)});
+                await calendar_single_op.calendars.delete({ calendarId: app_calendar_id }).catch((e) => {
+                    console.log(e);
+                });
                 await db.saveCalendarID(user_details.telegram_id, null);
             }
         } catch (e) {
@@ -1079,7 +1086,7 @@ function registerModeusSync() {
             if (buttons.length === 0) {
                 await ctx
                     .reply(
-                        `<b><u>🎓 Профили не найдены</u></b>\n\nПо вашему запросу "${user_name}" профили не найдены. Попробуйте еще раз или напишите @artem2584 для помощи.`,
+                        `<b><u>🎓 Профили не найдены</u></b>\n\nПо твоему запросу "${user_name}" профили не найдены. Попробуй еще раз или напиши @artem2584.`,
                         {
                             parse_mode: "HTML",
                             reply_markup: {
@@ -1091,7 +1098,7 @@ function registerModeusSync() {
             } else {
                 await ctx
                     .reply(
-                        `<b><u>🎓 Выбери свой профиль</u></b>\n\nНайдено профилей: <b>${search_results.length}</b> (показано макс. 5).\nЕсли нет твоего профиля, попробуй уточнить ФИО или напиши @artem2584.`,
+                        `<b><u>🎓 Выбери свой профиль</u></b>\n\nНайдено профилей: <b>${search_results.length}</b>.\nЕсли нет твоего профиля, попробуй уточнить ФИО или напиши @artem2584.`,
                         {
                             parse_mode: "HTML",
                             reply_markup: {
@@ -1107,7 +1114,7 @@ function registerModeusSync() {
         } catch (e) {
             Logger.errorMessage(`Error in modeus_listener textHandler: ${e.message} ${e.stack}`);
             await ctx
-                .reply("Произошла ошибка при поиске. Попробуйте позже.")
+                .reply("Произошла ошибка при поиске. Попробуй позже.")
                 .catch((e) => Logger.errorMessage(`Error replying search error: ${e.message}`));
         }
     });
@@ -1140,17 +1147,14 @@ function registerGoogleSync() {
 
         const url = googleOAuth.generateAuthUrl({
             access_type: "offline",
-            scope: [
-                "https://www.googleapis.com/auth/calendar.app.created",
-                "https://www.googleapis.com/auth/calendar.events",
-            ],
+            scope: ["https://www.googleapis.com/auth/calendar.app.created"],
             state: state,
             prompt: "consent",
         });
 
         ctx.reply(
-            `<b><u>📅 Подключение Google Calendar</u></b>\n\n❗ Бот создаст новый календарь "Modeus Integration" в вашем Google Аккаунте и будет управлять только им.\nВаши существующие календари и события затронуты не будут.\n\n<a href="${url}">➡️ Перейди по этой ссылке, чтобы разрешить доступ.</a>\n\nЕсли не получается привязать аккаунт, напиши @artem2584`,
-            { parse_mode: "HTML", disable_web_page_preview: true }
+            `<b><u>📅 Подключение Google Calendar</u></b>\n\n❗ Бот создаст новый календарь "Modeus Integration" в твоём Google Аккаунте и будет управлять только им.\nТвои существующие календари и события затронуты не будут.\n\n<a href="${url}">➡️ Перейди по этой ссылке, чтобы разрешить доступ.</a>\n\nЕсли не получается привязать аккаунт, напиши @artem2584`,
+            { parse_mode: "HTML" }
         ).catch((e) => Logger.errorMessage(`Error sending link_google prompt: ${e.message}`));
     });
 

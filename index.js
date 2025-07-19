@@ -358,7 +358,7 @@ async function findModeusEvents(attendees) {
         let prep_events = [];
 
         let event_locations = request.data._embedded["event-locations"];
-        let events = request.data._embedded.events;
+        let events = request.data._embedded.events ?? [];
 
         let location_map = new Map();
         let rooms = new Map();

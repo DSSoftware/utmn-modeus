@@ -439,52 +439,15 @@ async function findModeusEvents(attendees) {
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function callGoogleApiWithRetry(apiCallFunction, logContext = "", maxRetries = 5, initialDelayMs = 1000) {
-    let attempt = 0;
-    let currentDelayMs = initialDelayMs;
-    while (attempt < maxRetries) {
-        try {
-            return await apiCallFunction();
-        } catch (error) {
-            const statusCode = error.code;
-            const detailedErrors = error.errors;
+    try {
+        return await apiCallFunction();
+    } catch (error) {
+        const statusCode = error.code;
+        const detailedErrors = error.errors;
 
-            let isSpecificRateLimitReason = false;
-            if (statusCode === 403 && detailedErrors && Array.isArray(detailedErrors)) {
-                isSpecificRateLimitReason = detailedErrors.some(
-                    (e) => e.reason === "rateLimitExceeded" || e.reason === "userRateLimitExceeded"
-                );
-            }
-
-            const isRateLimitError = statusCode === 429 || isSpecificRateLimitReason;
-            const isServiceUnavailable = statusCode === 503;
-
-            if ((isRateLimitError || isServiceUnavailable) && attempt < maxRetries - 1) {
-                attempt++;
-                Logger.warnMessage(
-                    `${
-                        isRateLimitError ? "Rate limit" : "Service unavailable"
-                    } (Code: ${statusCode}) encountered for ${logContext}. Retrying in ${
-                        currentDelayMs / 1000
-                    }s... (Attempt ${attempt}/${maxRetries})`
-                );
-                await delay(currentDelayMs + Math.random() * 1000);
-                currentDelayMs = Math.min(currentDelayMs * 2, 60000);
-            } else {
-                let errorMessage = "Unknown API error";
-                if (detailedErrors && detailedErrors[0] && detailedErrors[0].message) {
-                    errorMessage = detailedErrors[0].message;
-                } else if (error.message) {
-                    errorMessage = error.message;
-                }
-                Logger.errorMessage(
-                    `Final error for ${logContext} after ${attempt + 1} attempts: ${errorMessage} (Code: ${statusCode})`
-                );
-                const finalError = new Error(`Final error for ${logContext}: ${errorMessage}`);
-                finalError.code = statusCode;
-                finalError.originalError = error;
-                throw finalError;
-            }
-        }
+        Logger.warnMessage(
+            `Error Code ${statusCode} encountered for ${logContext}.`
+        );
     }
 }
 
@@ -674,6 +637,8 @@ async function recheckModeus() {
                 }
             }
 
+            let batch_delete = [];
+
             if (batchGetRequests.length > 0) {
                 const getChunks = [];
                 for (let i = 0; i < batchGetRequests.length; i += GOOGLE_API_BATCH_LIMIT) {
@@ -729,6 +694,7 @@ async function recheckModeus() {
                                     Logger.warnMessage(
                                         `User ${user_modeus_id}: Error getting event Modeus ID ${correspondingModeusId} (GCal ID ${fetchedGoogleId}): ${errDetail.message} (Code: ${errDetail.code}). Will treat as needing new ID.`
                                     );
+                                    batch_delete.push(fetchedGoogleId);
                                 }
 
                                 if (!isValidAndActive) {
@@ -737,22 +703,21 @@ async function recheckModeus() {
                                     Logger.infoMessage(
                                         `User ${user_modeus_id}: Removed mapping for Modeus ID ${correspondingModeusId} from DB and current sync map.`
                                     );
+
                                 } else {
                                     modeusIdToActiveGoogleIdMap.set(correspondingModeusId, resp.id);
                                 }
                             }
                         } else {
                             Logger.warnMessage(
-                                `User ${user_modeus_id}: GET batch response for DB-known events was not an array (chunk ${
-                                    chunkIndex + 1
+                                `User ${user_modeus_id}: GET batch response for DB-known events was not an array (chunk ${chunkIndex + 1
                                 }).`
                             );
                         }
                     } catch (getBatchError) {
                         console.log(getBatchError);
                         Logger.errorMessage(
-                            `User ${user_modeus_id}: Critical error executing GET batch for DB-known events (chunk ${
-                                chunkIndex + 1
+                            `User ${user_modeus_id}: Critical error executing GET batch for DB-known events (chunk ${chunkIndex + 1
                             }). Events in this chunk will be treated as needing new IDs.`
                         );
 
@@ -766,6 +731,50 @@ async function recheckModeus() {
                         }
                     }
                     if (getChunks.length > 1 && chunkIndex < getChunks.length - 1) await delay(500);
+                }
+            }
+
+            let batchDeleteRequests = [];
+
+            if (batch_delete.length != 0) {
+                for (const missing_event of batch_delete) {
+                    batchDeleteRequests.push({
+                        method: "DELETE",
+                        endpoint: `https://www.googleapis.com/calendar/v3/calendars/${app_calendar_id}/events/${missing_event}`,
+                        customOperationId: missing_event,
+                    });
+                }
+
+                const deleteChunks = [];
+                for (let i = 0; i < batchDeleteRequests.length; i += GOOGLE_API_BATCH_LIMIT) {
+                    deleteChunks.push(batchDeleteRequests.slice(i, i + GOOGLE_API_BATCH_LIMIT));
+                }
+                Logger.infoMessage(
+                    `User ${user_modeus_id}: Prepared ${batchDeleteRequests.length} DELETE requests for stale DB-known events in ${deleteChunks.length} chunk(s).`
+                );
+
+                for (let chunkIndex = 0; chunkIndex < deleteChunks.length; chunkIndex++) {
+                    const currentDeleteChunk = deleteChunks[chunkIndex];
+
+                    const batchDeleteObj = {
+                        accessToken: accessToken,
+                        requests: currentDeleteChunk,
+                        api: { name: "calendar", version: "v3" },
+                        skipError: true,
+                    };
+                    try {
+                        Logger.infoMessage(
+                            `User ${user_modeus_id}: Executing GET batch ${chunkIndex + 1} for DB-known events.`
+                        );
+                        await RunBatch(batchDeleteObj);
+                    } catch (getBatchError) {
+                        console.log(getBatchError);
+                        Logger.errorMessage(
+                            `User ${user_modeus_id}: Critical error executing GET batch for DB-known events (chunk ${chunkIndex + 1
+                            }). Events in this chunk will be treated as needing new IDs.`
+                        );
+                    }
+                    if (deleteChunks.length > 1 && chunkIndex < deleteChunks.length - 1) await delay(500);
                 }
             }
 
@@ -798,9 +807,8 @@ async function recheckModeus() {
 
                 const eventResourceBase = {
                     summary: event_name,
-                    description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${
-                        event_data.attendees.length - event_data.teachers.length
-                    } участников\n\n${professor_list}\nОбновлено: ${refresh_display}`,
+                    description: `Курс: ${event_data.course}\n${event_data.name}\nУчастники: ${event_data.attendees.length - event_data.teachers.length
+                        } участников\n\n${professor_list}\nОбновлено: ${refresh_display}`,
                     start: { dateTime: event_data.start, timeZone: "Asia/Yekaterinburg" },
                     end: { dateTime: event_data.end, timeZone: "Asia/Yekaterinburg" },
                     location: event_data.room,
@@ -894,15 +902,13 @@ async function recheckModeus() {
                             }
                         } else {
                             Logger.warnMessage(
-                                `User ${user_modeus_id}: Final PUT/POST batch response was not an array (chunk ${
-                                    chunkIndex + 1
+                                `User ${user_modeus_id}: Final PUT/POST batch response was not an array (chunk ${chunkIndex + 1
                                 }).`
                             );
                         }
                     } catch (writeBatchError) {
                         Logger.errorMessage(
-                            `User ${user_modeus_id}: Critical error executing final PUT/POST batch (chunk ${
-                                chunkIndex + 1
+                            `User ${user_modeus_id}: Critical error executing final PUT/POST batch (chunk ${chunkIndex + 1
                             }): ${writeBatchError.message || JSON.stringify(writeBatchError)}.`
                         );
                     }
@@ -962,6 +968,8 @@ textHandlers.push(async (ctx) => {
                 });
                 await db.saveCalendarID(user_details.telegram_id, null);
             }
+
+            await db.removeCalendarEvents();
         } catch (e) {
             console.log(e);
         }
@@ -978,9 +986,9 @@ textHandlers.push(async (ctx) => {
 });
 
 bot.action(/reset_listeners/, async (ctx) => {
-    await ctx.answerCbQuery().catch(() => {});
+    await ctx.answerCbQuery().catch(() => { });
     user_states.set(ctx.from.id, "none");
-    ctx.deleteMessage(ctx.callbackQuery?.message?.message_id).catch(() => {});
+    ctx.deleteMessage(ctx.callbackQuery?.message?.message_id).catch(() => { });
 });
 
 init();
@@ -1001,7 +1009,7 @@ function registerInfoCommands() {
 
     bot.command("info", (ctx) => {
         (async () => {
-            ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+            ctx.deleteMessage(ctx.message.message_id).catch(() => { });
 
             let user_info = await db.getUserInfo(ctx.from.id);
 
@@ -1028,10 +1036,8 @@ function registerInfoCommands() {
             }
 
             ctx.reply(
-                `<b><u>👤 Информация</u></b>\n\n<u>🔗 Профили</u>\nПрофиль Modeus: <b>${
-                    linked_modeus ? "✅ Привязан" : "❌ Не привязан"
-                }</b>\nПрофиль Google: <b>${linked_google ? "✅ Привязан" : "❌ Не привязан"}</b>\n\nНастройка: <b>${
-                    can_refresh ? "✅ Готово к работе" : "❌ Один из профилей не привязан"
+                `<b><u>👤 Информация</u></b>\n\n<u>🔗 Профили</u>\nПрофиль Modeus: <b>${linked_modeus ? "✅ Привязан" : "❌ Не привязан"
+                }</b>\nПрофиль Google: <b>${linked_google ? "✅ Привязан" : "❌ Не привязан"}</b>\n\nНастройка: <b>${can_refresh ? "✅ Готово к работе" : "❌ Один из профилей не привязан"
                 }</b>\n\n<u>🔁 Последнее обновление</u>\nСписок событий Modeus обновлён <u>${relative_refresh}</u> (UTC+5)`,
                 {
                     parse_mode: "HTML",
@@ -1041,19 +1047,19 @@ function registerInfoCommands() {
     });
 
     bot.start((ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => { });
         sendHelpDialog(ctx);
     });
 
     bot.help((ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => { });
         sendHelpDialog(ctx);
     });
 }
 
 function registerModeusSync() {
     bot.command("link_modeus", (ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => { });
         ctx.reply(
             `<b><u>🎓 Подключение Modeus</u></b>\n\nВведи полное ФИО в таком порядке:\n<code>Иванов Иван Иванович</code>`,
             {
@@ -1121,7 +1127,7 @@ function registerModeusSync() {
 
     bot.action(/modeus_(.+)/, async (ctx) => {
         const profile_id = ctx.match[1];
-        await ctx.answerCbQuery().catch(() => {});
+        await ctx.answerCbQuery().catch(() => { });
         user_states.set(ctx.from.id, "none");
 
         await db.saveUserModeus(ctx.from.id, profile_id);
@@ -1137,7 +1143,7 @@ function registerModeusSync() {
 
 function registerGoogleSync() {
     bot.command("link_google", (ctx) => {
-        ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+        ctx.deleteMessage(ctx.message.message_id).catch(() => { });
 
         let issue_time = Math.floor(new Date().getTime() / 1000);
         let state = `${ctx.from.id}-${issue_time}-${crypto.hash(
@@ -1199,8 +1205,7 @@ function registerGoogleSync() {
                     .catch((e) => Logger.errorMessage(`Error sending TG message (success link): ${e.message}`));
             } catch (err) {
                 Logger.errorMessage(
-                    `Error exchanging Google token for tg_id ${tg_id}: ${err.message}. Code used: ${
-                        code ? code.substring(0, 20) + "..." : "N/A"
+                    `Error exchanging Google token for tg_id ${tg_id}: ${err.message}. Code used: ${code ? code.substring(0, 20) + "..." : "N/A"
                     }`
                 );
                 await db.deleteLoginAttempts(tg_id);
@@ -1222,7 +1227,7 @@ function registerGoogleSync() {
 function registerUtilityCommands() {
     bot.command("reset_calendar", (ctx) => {
         (async () => {
-            ctx.deleteMessage(ctx.message.message_id).catch(() => {});
+            ctx.deleteMessage(ctx.message.message_id).catch(() => { });
 
             db.saveCalendarID(ctx.from.id, null);
             ctx.reply("✅ Успех! Был создан новый календарь. Теперь твои события будут отображаться в нём.");

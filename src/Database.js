@@ -252,6 +252,15 @@ module.exports = class DatabaseHandler {
         }
     }
 
+    async removeCalendarEvents() {
+        try {
+            await this.connection.execute("DELETE FROM calendar_events WHERE 1");
+        } catch (err) {
+            console.log(err);
+            throw err;
+        }
+    }
+
     async cleanupOldEvents(timestamp, refresh_ts) {
         try {
             await this.connection.execute("DELETE FROM events WHERE `timestamp`<? OR `last_update`!=?", [timestamp, refresh_ts]);

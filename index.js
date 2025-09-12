@@ -386,19 +386,19 @@ async function findModeusEvents(attendees) {
                         try {
                             let place_info = "";
 
-                            if (event_locations[i].customLocation != null) {
+                            if (event_locations[i]?.customLocation) {
                                 place_info = event_locations[i].customLocation;
                             } else {
                                 let location = location_map.get(
-                                    event_locations[i]._links["event-rooms"].href.substring(1)
+                                    (event_locations[i]._links["event-rooms"]?.href ?? "").substring(1)
                                 );
-                                let room = rooms.get(location._links.room.href.substring(1));
-                                place_info = room.nameShort;
+                                let room = rooms.get((location?._links?.room?.href ?? "").substring(1));
+                                place_info = room?.nameShort ?? "N/A";
                             }
 
                             let course_name = courses.get(
-                                events[i]._links["cycle-realization"].href.substring(1)
-                            ).courseUnitRealizationNameShort;
+                                (events[i]?._links?.["cycle-realization"]?.href ?? "").substring(1)
+                            )?.courseUnitRealizationNameShort || "";
 
                             let event_attendees_data = await getEventAttendees(events[i].id);
                             let attendees_list = [];
@@ -803,6 +803,11 @@ async function recheckModeus() {
                 let type = event_data.typeId === "LECT" ? "L" : "S";
                 let color = event_data.typeId === "LECT" ? "10" : "1";
                 if (sas_event != null) event_name = `${sas_event}${type} / ${event_data.course}`;
+
+                if(event_data.typeId == "CUR_CHECK"){
+                    color = "4";
+                }
+
                 let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
 
                 const eventResourceBase = {

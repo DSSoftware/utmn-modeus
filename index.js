@@ -804,7 +804,11 @@ async function recheckModeus() {
                 let color = event_data.typeId === "LECT" ? "10" : "1";
                 if (sas_event != null) event_name = `${sas_event}${type} / ${event_data.course}`;
 
-                if(event_data.typeId == "CUR_CHECK"){
+                if(["CONS"].includes(event_data.typeId)){
+                    color = "2";
+                }
+
+                if(["MID_CHECK", "CUR_CHECK"].includes(event_data.typeId)){
                     color = "4";
                 }
 

@@ -811,6 +811,10 @@ async function recheckModeus() {
                 if(["MID_CHECK", "CUR_CHECK"].includes(event_data.typeId)){
                     color = "4";
                 }
+                
+                if(["EVENT_OTHER"].includes(event_data.typeId)){
+                    color = "8";
+                }
 
                 let professor_list = `Преподаватели:\n${event_data.teachers.join("\n") || "Не указаны"}`;
 

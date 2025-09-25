@@ -438,7 +438,48 @@ async function findModeusEvents(attendees) {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT) {
+// Очередь для операций с базой данных
+class DatabaseQueue {
+    constructor() {
+        this.queue = [];
+    }
+
+    // Добавляем операцию в очередь
+    enqueue(operation, description = 'DB operation') {
+        this.queue.push({ operation, description });
+    }
+
+    // Выполняем все операции последовательно
+    async executeAll() {
+        Logger.infoMessage(`Executing ${this.queue.length} database operations sequentially...`);
+        let successful = 0;
+        let failed = 0;
+
+        for (let i = 0; i < this.queue.length; i++) {
+            const { operation, description } = this.queue[i];
+            try {
+                await operation();
+                successful++;
+                if ((i + 1) % 50 === 0) {
+                    Logger.infoMessage(`Processed ${i + 1}/${this.queue.length} DB operations`);
+                }
+            } catch (error) {
+                failed++;
+                Logger.errorMessage(`Failed ${description}: ${error.message}`);
+            }
+        }
+
+        Logger.successMessage(`Database operations completed: ${successful} successful, ${failed} failed`);
+        this.queue = []; // Очищаем очередь
+        return { successful, failed };
+    }
+
+    size() {
+        return this.queue.length;
+    }
+}
+
+async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, dbQueue) {
     let user_modeus_id = gcal_user.attendee_id;
     Logger.infoMessage(`Starting Google Calendar sync for user ${user_modeus_id}`);
     
@@ -494,7 +535,10 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
                     `insert calendar for user ${user_modeus_id}`
                 );
                 app_calendar_id = newCal.data.id;
-                await db.saveCalendarID(user_details.telegram_id, app_calendar_id);
+                dbQueue.enqueue(
+                    () => db.saveCalendarID(user_details.telegram_id, app_calendar_id),
+                    `Save calendar ID for user ${user_modeus_id}`
+                );
                 Logger.infoMessage(`Created new calendar ${app_calendar_id} for user ${user_modeus_id}`);
             } catch (e) {
                 Logger.errorMessage(
@@ -591,7 +635,10 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
                             }
 
                             if (!isValidAndActive) {
-                                await db.deleteCalendarEvent(`${correspondingModeusId}-${user_modeus_id}`);
+                                dbQueue.enqueue(
+                                    () => db.deleteCalendarEvent(`${correspondingModeusId}-${user_modeus_id}`),
+                                    `Delete calendar event for user ${user_modeus_id}, modeus ID ${correspondingModeusId}`
+                                );
                                 modeusIdToActiveGoogleIdMap.delete(correspondingModeusId);
                                 Logger.infoMessage(
                                     `User ${user_modeus_id}: Removed mapping for Modeus ID ${correspondingModeusId} from DB and current sync map.`
@@ -618,7 +665,10 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
                         const gId = req.customOperationId;
                         const mId = googleIdToModeusIdForGet.get(gId);
                         if (mId) {
-                            await db.deleteCalendarEvent(`${mId}-${user_modeus_id}`);
+                            dbQueue.enqueue(
+                                () => db.deleteCalendarEvent(`${mId}-${user_modeus_id}`),
+                                `Delete calendar event for user ${user_modeus_id}, modeus ID ${mId}`
+                            );
                             modeusIdToActiveGoogleIdMap.delete(mId);
                         }
                     }
@@ -785,10 +835,13 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
                                             `User ${user_modeus_id}: POST success for Modeus ID ${opModeusId}, but GCal ID mismatch! Expected ${attemptedGoogleId}, got ${resp.id}. Saving actual returned ID.`
                                         );
                                     }
-                                    await db.saveCalendarEvent(
-                                        `${opModeusId}-${user_modeus_id}`,
-                                        resp.id,
-                                        eventTimestamp
+                                    dbQueue.enqueue(
+                                        () => db.saveCalendarEvent(
+                                            `${opModeusId}-${user_modeus_id}`,
+                                            resp.id,
+                                            eventTimestamp
+                                        ),
+                                        `Save calendar event for user ${user_modeus_id}, modeus ID ${opModeusId}`
                                     );
                                 }
                             } else {
@@ -798,7 +851,10 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
                                     Logger.warnMessage(
                                         `User ${user_modeus_id}: PUT failed with 404 for Modeus ID ${opModeusId} (GCal ID ${attemptedGoogleId}). Deleting DB record.`
                                     );
-                                    await db.deleteCalendarEvent(`${opModeusId}-${user_modeus_id}`);
+                                    dbQueue.enqueue(
+                                        () => db.deleteCalendarEvent(`${opModeusId}-${user_modeus_id}`),
+                                        `Delete calendar event for user ${user_modeus_id}, modeus ID ${opModeusId}`
+                                    );
                                 } else if (originalReq.method === "POST" && errDetail.code === 409) {
                                     Logger.warnMessage(
                                         `User ${user_modeus_id}: POST failed with 409 (Conflict) for Modeus ID ${opModeusId} with NEW GCal ID ${attemptedGoogleId}. This is unexpected with random IDs. Not saving to DB.`
@@ -830,7 +886,7 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
     }
 }
 
-async function processUsersInBatches(logged_google_users, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, maxConcurrency = 5) {
+async function processUsersInBatches(logged_google_users, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, maxConcurrency = 5, dbQueue) {
     const users = Array.isArray(logged_google_users) ? logged_google_users : await logged_google_users;
     const totalUsers = users.length;
     let processedUsers = 0;
@@ -847,7 +903,7 @@ async function processUsersInBatches(logged_google_users, calendarOAuthInstance,
         // Обрабатываем группу пользователей параллельно
         const promises = batch.map(async (gcal_user) => {
             try {
-                await processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT);
+                await processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, dbQueue);
                 processedUsers++;
                 successfulUsers++;
                 Logger.infoMessage(`✓ Successfully completed user ${processedUsers}/${totalUsers} (${gcal_user.attendee_id})`);
@@ -996,11 +1052,16 @@ async function recheckModeus() {
     let refresh_display = `${day(rd)}.${month(rd)}.${year(rd)} ${hour(rd)}:${minute(rd)}:${second(rd)}`;
 
     let modeusEventDetailsCache = new Map();
+    let dbQueue = new DatabaseQueue();
 
     // Обрабатываем пользователей в параллельном режиме с ограничением до 5 одновременных операций
-    const syncStats = await processUsersInBatches(logged_google_users, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, 5);
+    const syncStats = await processUsersInBatches(logged_google_users, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, 5, dbQueue);
     
-    Logger.successMessage(`Finished syncing all users with Google Calendar. Stats: ${syncStats.successful}/${syncStats.total} successful`);
+    // Выполняем все накопленные операции с БД последовательно
+    Logger.infoMessage(`Google Calendar sync completed. Executing ${dbQueue.size()} database operations...`);
+    const dbStats = await dbQueue.executeAll();
+    
+    Logger.successMessage(`Finished syncing all users with Google Calendar. Stats: ${syncStats.successful}/${syncStats.total} successful, DB operations: ${dbStats.successful}/${dbStats.successful + dbStats.failed} successful`);
     console.log(`Google Sync Total Time: ${Math.floor(new Date().getTime() / 1000) - google_sync_start_time} seconds`);
 }
 

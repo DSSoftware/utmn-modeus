@@ -887,13 +887,18 @@ async function processGoogleCalendarUser(gcal_user, calendarOAuthInstance, refre
 }
 
 async function processUsersInBatches(logged_google_users, calendarOAuthInstance, refresh_display, modeusEventDetailsCache, GOOGLE_API_BATCH_LIMIT, maxConcurrency = 5, dbQueue) {
-    const users = Array.isArray(logged_google_users) ? logged_google_users : await logged_google_users;
+    const users = logged_google_users; // Уже массив
     const totalUsers = users.length;
     let processedUsers = 0;
     let successfulUsers = 0;
     let failedUsers = 0;
 
     Logger.infoMessage(`Starting to process ${totalUsers} users with max concurrency of ${maxConcurrency}`);
+
+    if (totalUsers === 0) {
+        Logger.infoMessage("No users to process for Google Calendar sync");
+        return { total: 0, successful: 0, failed: 0 };
+    }
 
     // Разбиваем пользователей на группы для обработки
     for (let i = 0; i < totalUsers; i += maxConcurrency) {
@@ -1016,7 +1021,10 @@ async function recheckModeus() {
         await Promise.all(db_save_promises);
     }
 
-    let students = db.getRecheckUsers();
+    let students = [];
+    for await (const student of db.getRecheckUsers()) {
+        students.push(student);
+    }
     for await (const student_user of students) {
         if (attendees_for_modeus_fetch.length >= 25) {
             await fetchAssociatedEvents(attendees_for_modeus_fetch);
@@ -1041,7 +1049,10 @@ async function recheckModeus() {
     let google_sync_start_time = Math.floor(new Date().getTime() / 1000);
     const GOOGLE_API_BATCH_LIMIT = 50;
 
-    let logged_google_users = db.getLoggedAttendees();
+    let logged_google_users = [];
+    for await (const user of db.getLoggedAttendees()) {
+        logged_google_users.push(user);
+    }
     const calendarOAuthInstance = new google.auth.OAuth2(
         config.google.client_id,
         config.google.secret_id,

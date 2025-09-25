@@ -20,6 +20,11 @@ class TelegramBotService {
         this.setupBot();
     }
 
+    triggerManualSync(){
+        console.log("Not implemented.");
+        return false;
+    }
+
     /**
      * Setup bot handlers and middleware
      */
@@ -34,7 +39,7 @@ class TelegramBotService {
         this.setupActionHandlers();
         
         // Setup error handling
-        this.bot.catch((error) => {
+        this.bot.catch((error) => {3
             logger.error("Bot error", error);
         });
 
@@ -275,8 +280,8 @@ class TelegramBotService {
 
         if (text === "redo_checks") {
             try {
-                // This would trigger a manual sync - implemented in SyncService
                 await ctx.reply("Manual sync triggered");
+                await this.triggerManualSync();
             } catch (error) {
                 logger.error("Error triggering manual sync", error);
                 await ctx.reply("Error triggering sync");

@@ -12,7 +12,14 @@ async function recheckModeus(db) {
 
     async function fetchAssociatedEvents(attendee_list) {
         let events = await findModeusEvents(attendee_list, db);
-        let db_save_promises = [];
+
+        if (events.length === 0) return;
+
+        // Batch prepare all event data
+        const eventBatchData = [];
+        const userEventBatchData = [];
+
+        // Этап 1: Подготавливаем все события для батчевой вставки
         for (const event of events) {
             events_stat++;
             let event_object = {
@@ -27,23 +34,24 @@ async function recheckModeus(db) {
                 teachers: event.teachers,
             };
             let timestamp = new Date(event.info.startsAt).getTime() / 1000;
-            for (const attendee_id of attendee_list) {
-                if (!event_object.attendees.includes(attendee_id)) continue;
-                db_save_promises.push(
-                    db.saveUserEvent(
-                        `${attendee_id};${event.info.id}`,
-                        attendee_id,
-                        event.info.id,
-                        recheck_started_modeus,
-                        timestamp
-                    )
-                );
-            }
-            db_save_promises.push(
-                db.saveEvent(event.info.id, recheck_started_modeus, timestamp, JSON.stringify(event_object))
-            );
+            
+            eventBatchData.push([event.info.id, recheck_started_modeus, timestamp, JSON.stringify(event_object)]);
         }
-        await Promise.all(db_save_promises);
+
+        // Этап 2: Подготавливаем все связи пользователь-событие для батчевой вставки
+        for (const event of events) {
+            let timestamp = new Date(event.info.startsAt).getTime() / 1000;
+            for (const attendee_id of attendee_list) {
+                if (!event.attendee_list.includes(attendee_id)) continue;
+                
+                const eventKey = `${attendee_id};${event.info.id}`;
+                userEventBatchData.push([eventKey, attendee_id, event.info.id, recheck_started_modeus, timestamp]);
+            }
+        }
+
+        // Выполняем батчевые операции вместо individual queries
+        await db.batchSaveEvents(eventBatchData);
+        await db.batchSaveUserEvents(userEventBatchData);
     }
 
     const students = db.getRecheckUsers();
@@ -53,7 +61,8 @@ async function recheckModeus(db) {
     for await (const student_user of students) {
         currentChunk.push(student_user.attendee_id);
         students_stat++;
-        if (currentChunk.length >= 10) {
+        // Увеличиваем размер чанка с 15 до 50 для лучшей производительности
+        if (currentChunk.length >= 15) {
             studentChunks.push(currentChunk);
             currentChunk = [];
         }
@@ -62,7 +71,17 @@ async function recheckModeus(db) {
         studentChunks.push(currentChunk);
     }
 
-    await Promise.all(studentChunks.map(chunk => fetchAssociatedEvents(chunk)));
+    Logger.infoMessage(`Processing ${students_stat} students in ${studentChunks.length} chunks`);
+
+    // Обрабатываем чанки с таймером для лучшего мониторинга
+    let chunkIndex = 0;
+    for (const chunk of studentChunks) {
+        const chunkStart = Date.now();
+        await fetchAssociatedEvents(chunk);
+        const chunkTime = (Date.now() - chunkStart) / 1000;
+        chunkIndex++;
+        Logger.infoMessage(`Processed chunk ${chunkIndex}/${studentChunks.length} (${chunk.length} students) in ${chunkTime.toFixed(2)}s`);
+    }
 
 
     Logger.successMessage("Rechecked Modeus Events.");

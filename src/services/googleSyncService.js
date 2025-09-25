@@ -14,11 +14,31 @@ async function syncGoogleCalendar(db) {
     const logged_google_users = db.getLoggedAttendees();
     const userProcessingPromises = [];
 
+    let batch = [];
+
     for await (const gcal_user of logged_google_users) {
-        userProcessingPromises.push(processUser(gcal_user, db, refresh_display));
+        if(batch.length >= 5){
+            userProcessingPromises.push(batch);
+            batch = [];
+        }
+        batch.push(gcal_user);
     }
 
-    await Promise.all(userProcessingPromises);
+    async function batchProcess(batch){
+        let runners = [];
+
+        for(const user of batch){
+            runners.push(processUser(user, db, refresh_display));
+        }
+        
+        await Promise.allSettled(runners);
+    }
+
+    userProcessingPromises.push(batch);
+
+    for(const batch of userProcessingPromises){
+        await batchProcess(batch);
+    }
 
     Logger.successMessage("Finished syncing all users with Google Calendar.");
     console.log(`Google Sync Total Time: ${Math.floor(new Date().getTime() / 1000) - google_sync_start_time} seconds`);
@@ -33,6 +53,8 @@ async function processUser(gcal_user, db, refresh_display) {
             Logger.infoMessage(`User ${user_modeus_id}: No Modeus events to sync.`);
             return;
         }
+
+        Logger.infoMessage(`User ${user_modeus_id}: Found ${modeus_events_for_this_user.length} events to sync.`);
 
         const user_details_array = await db.findAttendee(user_modeus_id);
         if (!user_details_array || user_details_array.length === 0) {
@@ -102,7 +124,10 @@ async function processUser(gcal_user, db, refresh_display) {
         }
 
     } catch (userProcessingError) {
-        Logger.errorMessage(`Overall error processing Google Calendar for user ${user_modeus_id}: ${userProcessingError.message} ${userProcessingError.stack}`);
+        const errorMessage = userProcessingError?.message || String(userProcessingError) || 'Unknown error';
+        const errorStack = userProcessingError?.stack || 'No stack trace available';
+        Logger.errorMessage(`Overall error processing Google Calendar for user ${user_modeus_id}: ${errorMessage}`);
+        Logger.errorMessage(`Stack trace: ${errorStack}`);
     }
 }
 
@@ -152,7 +177,7 @@ async function checkExistingEvents(db, user_modeus_id, modeus_events_for_this_us
                 if (resp?.error?.code === 404 || resp.status === "cancelled") {
                     batch_delete.push(fetchedGoogleId);
                 }
-                await db.deleteCalendarEvent(`${correspondingModeusId}-${user_modeus_id}`);
+                await db.deleteCalendarEvent(`${correspondingModeusId};${user_modeus_id}`);
                 modeusIdToActiveGoogleIdMap.delete(correspondingModeusId);
                 Logger.infoMessage(`User ${user_modeus_id}: Removed mapping for Modeus ID ${correspondingModeusId} from DB and current sync map.`);
             }
@@ -240,36 +265,71 @@ function createEventResource(event_data, refresh_display) {
 
 async function processWriteResponses(writeBatchResponses, originalReqs, db, user_modeus_id) {
     if (!Array.isArray(writeBatchResponses)) {
-        Logger.warnMessage(`User ${user_modeus_id}: Final PUT/POST batch response was not an array.`);
+        Logger.warnMessage(`User ${user_modeus_id}: Final PUT/POST batch response was not an array: ${JSON.stringify(writeBatchResponses)}`);
         return;
     }
 
+    if (!Array.isArray(originalReqs)) {
+        Logger.warnMessage(`User ${user_modeus_id}: Original requests array is not valid: ${JSON.stringify(originalReqs)}`);
+        return;
+    }
+
+    const eventTimestamp = Math.floor(Date.now() / 1000);
+
+    // Simple index-based matching since gbatchrequests should preserve order
     for (let respIdx = 0; respIdx < writeBatchResponses.length; respIdx++) {
         const resp = writeBatchResponses[respIdx];
+
+        if (respIdx >= originalReqs.length) {
+            Logger.warnMessage(`User ${user_modeus_id}: Response index ${respIdx} exceeds original requests length ${originalReqs.length}`);
+            continue;
+        }
+
         const originalReq = originalReqs[respIdx];
-        if (!originalReq) continue;
+        if (!originalReq) {
+            Logger.warnMessage(`User ${user_modeus_id}: No original request found for response index ${respIdx}`);
+            continue;
+        }
 
         const opModeusId = originalReq.customOperationId;
-        const eventDetails = await db.getEvent(opModeusId);
-        const event_data = JSON.parse(eventDetails[0].event_data);
-        const eventTimestamp = Math.floor(new Date(event_data.start).getTime() / 1000) || Math.floor(Date.now() / 1000);
+        if (!opModeusId) {
+            Logger.warnMessage(`User ${user_modeus_id}: No Modeus ID (customOperationId) found for response index ${respIdx}`);
+            continue;
+        }
         const attemptedGoogleId = originalReq.originalGoogleId;
-
-        if (resp.id) {
-            if (originalReq.method === "POST") {
-                if (resp.id !== attemptedGoogleId) {
-                    Logger.warnMessage(`User ${user_modeus_id}: POST success for Modeus ID ${opModeusId}, but GCal ID mismatch! Expected ${attemptedGoogleId}, got ${resp.id}. Saving actual returned ID.`);
-                }
-                await db.saveCalendarEvent(`${opModeusId}-${user_modeus_id}`, resp.id, eventTimestamp);
-            }
-        } else {
-            const errDetail = resp?.error || resp?.result?.error || { message: "Unknown error" };
-            if (originalReq.method === "PUT" && errDetail.code === 404) {
+        
+        // Handle batch response structure - check if response has result or is direct result
+        const actualResult = resp.result || resp;
+        const responseError = resp.error || actualResult.error;
+        
+        if (responseError) {
+            Logger.errorMessage(`User ${user_modeus_id}: Error in response for Modeus ID ${opModeusId}: ${JSON.stringify(responseError)}`);
+            
+            if (originalReq.method === "PUT" && responseError.code === 404) {
                 Logger.warnMessage(`User ${user_modeus_id}: PUT failed with 404 for Modeus ID ${opModeusId} (GCal ID ${attemptedGoogleId}). Deleting DB record.`);
-                await db.deleteCalendarEvent(`${opModeusId}-${user_modeus_id}`);
-            } else if (originalReq.method === "POST" && errDetail.code === 409) {
+                await db.deleteCalendarEvent(`${opModeusId};${user_modeus_id}`);
+            } else if (originalReq.method === "POST" && responseError.code === 409) {
                 Logger.warnMessage(`User ${user_modeus_id}: POST failed with 409 (Conflict) for Modeus ID ${opModeusId} with NEW GCal ID ${attemptedGoogleId}. This is unexpected with random IDs. Not saving to DB.`);
             }
+            continue;
+        }
+        
+        if (actualResult.id) {
+            try {
+                if (originalReq.method === "POST") {
+                    if (actualResult.id !== attemptedGoogleId) {
+                        Logger.warnMessage(`User ${user_modeus_id}: POST success for Modeus ID ${opModeusId}, but GCal ID mismatch! Expected ${attemptedGoogleId}, got ${actualResult.id}. Saving actual returned ID.`);
+                    }
+                    await db.saveCalendarEvent(`${opModeusId};${user_modeus_id}`, actualResult.id, eventTimestamp);
+                } else if (originalReq.method === "PUT") {
+                    // For PUT requests, we should also ensure the mapping exists in DB
+                    await db.saveCalendarEvent(`${opModeusId};${user_modeus_id}`, actualResult.id, eventTimestamp);
+                }
+            } catch (saveError) {
+                Logger.errorMessage(`User ${user_modeus_id}: Failed to save calendar event for Modeus ID ${opModeusId}: ${saveError.message}`);
+            }
+        } else {
+            Logger.errorMessage(`User ${user_modeus_id}: No ID in successful response for Modeus ID ${opModeusId}: ${JSON.stringify(actualResult)}`);
         }
     }
 }

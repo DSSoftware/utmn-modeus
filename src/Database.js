@@ -150,44 +150,28 @@ module.exports = class DatabaseHandler {
     async *getRecheckUsers() {
         if (!this.connection) throw new Error("Database not connected");
         const sql = "SELECT * FROM students WHERE `attendee_id` IS NOT NULL AND `google_token` IS NOT NULL";
-        let conn;
-
         try {
-            conn = await this.connection.getConnection();
-            const stream = conn.query(sql).stream();
-
-            for await (const row of stream) {
+            const [rows] = await this.connection.query(sql);
+            for (const row of rows) {
                 yield row;
             }
         } catch (err) {
             Logger.errorMessage(`Error in getRecheckUsers: ${err.message}`);
-            throw err; 
-        } finally {
-            if (conn) {
-                conn.release();
-            }
+            throw err;
         }
     }
     
     async *getLoggedAttendees() {
         if (!this.connection) throw new Error("Database not connected");
         const sql = "SELECT `attendee_id` FROM student_events GROUP BY `attendee_id`";
-        let conn;
-
         try {
-            conn = await this.connection.getConnection();
-            const stream = conn.query(sql).stream();
-
-            for await (const row of stream) {
+            const [rows] = await this.connection.query(sql);
+            for (const row of rows) {
                 yield row;
             }
         } catch (err) {
             Logger.errorMessage(`Error in getLoggedAttendees: ${err.message}`);
-            throw err; 
-        } finally {
-            if (conn) {
-                conn.release();
-            }
+            throw err;
         }
     }
 
@@ -274,7 +258,9 @@ module.exports = class DatabaseHandler {
     async saveCalendarEvent(modeus_id, calendar_id, timestamp) {
         if (!this.connection) throw new Error("Database not connected");
         try {
+            Logger.infoMessage(`Saving calendar event: modeus_id=${modeus_id}, calendar_id=${calendar_id}, timestamp=${timestamp}`);
             await this.connection.execute("INSERT INTO calendar_events (`modeus_id`, `calendar_id`, `timestamp`) VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE `calendar_id`=?, `timestamp`=?", [modeus_id, calendar_id, timestamp, calendar_id, timestamp]);
+            Logger.infoMessage(`Successfully saved calendar event for modeus_id ${modeus_id}`);
         } catch (err) {
             Logger.errorMessage(`Error in saveCalendarEvent for modeus_id ${modeus_id}: ${err.message}`);
             throw err;
@@ -319,6 +305,52 @@ module.exports = class DatabaseHandler {
             await this.connection.execute("DELETE FROM student_events WHERE `timestamp`<? AND `last_update`<?", [timestamp, recheck]);
         } catch (err) {
             Logger.errorMessage(`Error in cleanupOldStudentEvents: ${err.message}`);
+            throw err;
+        }
+    }
+
+    async executeBatch(sql, params) {
+        if (!this.connection) throw new Error("Database not connected");
+        try {
+            await this.connection.execute(sql, params);
+        } catch (err) {
+            Logger.errorMessage(`Error in executeBatch: ${err.message}`);
+            throw err;
+        }
+    }
+
+    async batchSaveEvents(eventDataArray) {
+        if (!this.connection) throw new Error("Database not connected");
+        if (eventDataArray.length === 0) return;
+        
+        try {
+            const placeholders = eventDataArray.map(() => '(?, ?, ?, ?)').join(', ');
+            const flatParams = eventDataArray.flat();
+            const sql = `INSERT INTO events (event_id, last_update, timestamp, event_data) VALUES ${placeholders} 
+                         ON DUPLICATE KEY UPDATE last_update=VALUES(last_update), timestamp=VALUES(timestamp), event_data=VALUES(event_data)`;
+            
+            await this.connection.execute(sql, flatParams);
+            Logger.infoMessage(`Batch saved ${eventDataArray.length} events`);
+        } catch (err) {
+            Logger.errorMessage(`Error in batchSaveEvents: ${err.message}`);
+            throw err;
+        }
+    }
+
+    async batchSaveUserEvents(userEventDataArray) {
+        if (!this.connection) throw new Error("Database not connected");
+        if (userEventDataArray.length === 0) return;
+        
+        try {
+            const placeholders = userEventDataArray.map(() => '(?, ?, ?, ?, ?)').join(', ');
+            const flatParams = userEventDataArray.flat();
+            const sql = `INSERT INTO student_events (event, attendee_id, event_id, last_update, timestamp) VALUES ${placeholders} 
+                         ON DUPLICATE KEY UPDATE attendee_id=VALUES(attendee_id), event_id=VALUES(event_id), last_update=VALUES(last_update), timestamp=VALUES(timestamp)`;
+            
+            await this.connection.execute(sql, flatParams);
+            Logger.infoMessage(`Batch saved ${userEventDataArray.length} user events`);
+        } catch (err) {
+            Logger.errorMessage(`Error in batchSaveUserEvents: ${err.message}`);
             throw err;
         }
     }

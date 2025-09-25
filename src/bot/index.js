@@ -37,7 +37,7 @@ function setupBot(db) {
                     config.google.secret_id,
                     config.google.redirect
                 );
-                for (const gcal_user of logged_google_users) {
+                for await (const gcal_user of logged_google_users) {
                     let user_modeus_id = gcal_user.attendee_id;
                     let user_details_array = await db.findAttendee(user_modeus_id);
                     let user_details = user_details_array[0];

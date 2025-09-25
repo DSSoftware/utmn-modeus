@@ -368,7 +368,7 @@ ID твоего профиля: <code>${profileId}</code>`;
                 return "никогда";
             }
 
-            const date = new Date((lastRefresh[0].value * 1000) + (5 * 60 * 60 * 1000));
+            const date = new Date(lastRefresh[0].value * 1000);
             return date.toLocaleString('ru-RU', {
                 timeZone: 'Asia/Yekaterinburg',
                 day: '2-digit',

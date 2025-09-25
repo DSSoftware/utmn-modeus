@@ -1,22 +1,51 @@
 {
   "name": "utmn-modeus",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "version": "2.0.0",
+  "description": "Modern, scalable bot for syncing UTMN Modeus schedule with Google Calendar",
+  "main": "app.js",
+  "engines": {
+    "node": ">=16.0.0"
   },
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "NODE_ENV=development node app.js",
+    "prod": "NODE_ENV=production node app.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "eslint src/ app.js",
+    "lint:fix": "eslint src/ app.js --fix",
+    "health": "node -e \"require('./app.js').getHealthStatus().then(h => console.log(JSON.stringify(h, null, 2)))\"",
+    "stats": "node -e \"require('./app.js').getStats().then(s => console.log(JSON.stringify(s, null, 2)))\""
+  },
+  "keywords": [
+    "modeus",
+    "google-calendar",
+    "telegram-bot",
+    "schedule",
+    "utmn",
+    "automation",
+    "sync"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "axios": "^1.8.3",
     "chalk": "^4.1.2",
     "dotenv": "^16.4.7",
+    "gbatchrequests": "^1.0.0",
     "googleapis": "^148.0.0",
     "mysql2": "^3.13.0",
     "telegraf": "^4.16.3"
   },
   "devDependencies": {
-    "gbatchrequests": "^1.0.0"
-  }
+    "eslint": "^8.57.0",
+    "nodemon": "^3.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-username/utmn-modeus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/utmn-modeus/issues"
+  },
+  "homepage": "https://github.com/your-username/utmn-modeus#readme"
 }

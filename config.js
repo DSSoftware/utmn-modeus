@@ -1,6 +1,11 @@
+// Legacy configuration file - deprecated
+// Please use the new ConfigManager in src/utils/ConfigManager.js
+
+console.log("⚠️  Warning: config.js is deprecated. Please migrate to the new configuration system.");
+
 require("dotenv").config();
 
-module.exports = {
+const legacyConfig = {
     credentials: {
         internal: process.env.INTERNAL_TOKEN,
         telegram: process.env.TELEGRAM_TOKEN,
@@ -23,3 +28,5 @@ module.exports = {
     },
     admin: process.env.ADMIN_ID,
 };
+
+module.exports = legacyConfig;

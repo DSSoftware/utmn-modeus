@@ -413,7 +413,9 @@ ID твоего профиля: <code>${profileId}</code>`;
      */
     async start() {
         try {
-            await this.bot.launch();
+            this.bot.launch().catch(e => 
+                logger.error("Failed to start Telegram bot", e)
+            );
             logger.success("Telegram bot started successfully");
 
             // Graceful stop handlers

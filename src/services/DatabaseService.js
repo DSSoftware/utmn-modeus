@@ -190,23 +190,23 @@ class DatabaseService {
     }
 
     // Event management methods
-    async saveEvent(eventId, lastCheck, timestamp, eventData) {
+    async saveEvent(eventId, lastUpdate, timestamp, eventData) {
         await this.query(
-            "INSERT INTO events (`id`, `last_check`, `timestamp`, `event_data`) VALUES(?, ?, ?, ?) ON DUPLICATE KEY UPDATE `last_check`=?, `event_data`=?",
-            [eventId, lastCheck, timestamp, eventData, lastCheck, eventData]
+            "INSERT INTO events (`event_id`, `last_update`, `timestamp`, `event_data`) VALUES(?, ?, ?, ?) ON DUPLICATE KEY UPDATE `last_update`=?, `event_data`=?",
+            [eventId, lastUpdate, timestamp, eventData, lastUpdate, eventData]
         );
     }
 
-    async saveUserEvent(uniqueId, attendeeId, eventId, lastCheck, timestamp) {
+    async saveUserEvent(eventKey, attendeeId, eventId, lastUpdate, timestamp) {
         await this.query(
-            "INSERT INTO student_events (`unique_id`, `attendee_id`, `event_id`, `last_check`, `timestamp`) VALUES(?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE `last_check`=?",
-            [uniqueId, attendeeId, eventId, lastCheck, timestamp, lastCheck]
+            "INSERT INTO student_events (`event`, `attendee_id`, `event_id`, `last_update`, `timestamp`) VALUES(?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE `last_update`=?",
+            [eventKey, attendeeId, eventId, lastUpdate, timestamp, lastUpdate]
         );
     }
 
     async getEvent(eventId) {
         return await this.query(
-            "SELECT * FROM events WHERE `id`=?",
+            "SELECT * FROM events WHERE `event_id`=?",
             [eventId]
         );
     }
@@ -231,47 +231,51 @@ class DatabaseService {
     }
 
     // Calendar event methods
-    async saveCalendarEvent(uniqueId, calendarId, timestamp, eventTimestamp) {
+    async saveCalendarEvent(modeusId, calendarId, timestamp) {
         await this.query(
-            "INSERT INTO calendar_events (`unique_id`, `calendar_id`, `timestamp`, `event_timestamp`) VALUES(?, ?, ?, ?) ON DUPLICATE KEY UPDATE `calendar_id`=?, `timestamp`=?",
-            [uniqueId, calendarId, timestamp, eventTimestamp, calendarId, timestamp]
+            "INSERT INTO calendar_events (`modeus_id`, `calendar_id`, `timestamp`) VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE `calendar_id`=?, `timestamp`=?",
+            [modeusId, calendarId, timestamp, calendarId, timestamp]
         );
     }
 
-    async findCalendarEvent(uniqueId) {
+    async findCalendarEvent(modeusId) {
         return await this.query(
-            "SELECT * FROM calendar_events WHERE `unique_id`=?",
-            [uniqueId]
+            "SELECT * FROM calendar_events WHERE `modeus_id`=?",
+            [modeusId]
         );
     }
 
-    async deleteCalendarEvent(uniqueId) {
+    async deleteCalendarEvent(modeusId) {
         await this.query(
-            "DELETE FROM calendar_events WHERE `unique_id`=?",
-            [uniqueId]
+            "DELETE FROM calendar_events WHERE `modeus_id`=?",
+            [modeusId]
         );
     }
 
     async removeCalendarEvents() {
         await this.query("DELETE FROM calendar_events");
-        logger.info("All calendar events removed", "Database");
+        logger.info("All calendar events removed");
     }
 
     // Cleanup methods
-    async cleanupOldEvents(mondayTimestamp, lastCheck) {
+    async cleanupOldEvents(mondayTimestamp, lastUpdate) {
         const result = await this.query(
-            "DELETE FROM events WHERE `timestamp` < ? AND `last_check` != ?",
-            [mondayTimestamp, lastCheck]
+            "DELETE FROM events WHERE `timestamp` < ? AND `last_update` != ?",
+            [mondayTimestamp, lastUpdate]
         );
-        logger.info(`Cleaned up ${result.affectedRows} old events`, "Database");
+        
+        const affectedRows = result && result.affectedRows ? result.affectedRows : 0;
+        logger.info(`Cleaned up ${affectedRows} old events`);
     }
 
-    async cleanupOldStudentEvents(mondayTimestamp, lastCheck) {
+    async cleanupOldStudentEvents(mondayTimestamp, lastUpdate) {
         const result = await this.query(
-            "DELETE FROM student_events WHERE `timestamp` < ? AND `last_check` != ?",
-            [mondayTimestamp, lastCheck]
+            "DELETE FROM student_events WHERE `timestamp` < ? AND `last_update` != ?",
+            [mondayTimestamp, lastUpdate]
         );
-        logger.info(`Cleaned up ${result.affectedRows} old student events`, "Database");
+        
+        const affectedRows = result && result.affectedRows ? result.affectedRows : 0;
+        logger.info(`Cleaned up ${affectedRows} old student events`);
     }
 
     /**

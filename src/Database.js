@@ -258,9 +258,7 @@ module.exports = class DatabaseHandler {
     async saveCalendarEvent(modeus_id, calendar_id, timestamp) {
         if (!this.connection) throw new Error("Database not connected");
         try {
-            Logger.infoMessage(`Saving calendar event: modeus_id=${modeus_id}, calendar_id=${calendar_id}, timestamp=${timestamp}`);
             await this.connection.execute("INSERT INTO calendar_events (`modeus_id`, `calendar_id`, `timestamp`) VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE `calendar_id`=?, `timestamp`=?", [modeus_id, calendar_id, timestamp, calendar_id, timestamp]);
-            Logger.infoMessage(`Successfully saved calendar event for modeus_id ${modeus_id}`);
         } catch (err) {
             Logger.errorMessage(`Error in saveCalendarEvent for modeus_id ${modeus_id}: ${err.message}`);
             throw err;

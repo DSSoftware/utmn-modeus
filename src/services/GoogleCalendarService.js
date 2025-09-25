@@ -280,7 +280,7 @@ class GoogleCalendarService {
         // Prepare batch GET requests for existing events
         for (const userEvent of modeusEvents) {
             const modeusEventId = userEvent.event_id;
-            const uniqueEventId = `${modeusEventId}-${userId}`;
+            const uniqueEventId = `${userId};${modeusEventId}`;
             const dbCalendarEntries = await this.database.findCalendarEvent(uniqueEventId);
 
             if (dbCalendarEntries?.[0]?.calendar_id) {
@@ -343,7 +343,7 @@ class GoogleCalendarService {
             } else {
                 // Event not found or cancelled, remove from database
                 if (modeusEventId) {
-                    this.database.deleteCalendarEvent(`${modeusEventId}-${userId}`).catch(() => {});
+                    this.database.deleteCalendarEvent(`${userId};${modeusEventId}`).catch(() => {});
                 }
             }
         }
@@ -387,14 +387,13 @@ class GoogleCalendarService {
                     originalGoogleId: existingGoogleEventId,
                 });
             } else {
-                // Create new event
-                const newGoogleEventId = crypto.randomBytes(16).toString("hex");
+                // Create new event - let Google generate the ID
                 batchOperations.push({
                     method: "POST",
                     endpoint: `https://www.googleapis.com/calendar/v3/calendars/${calendarId}/events`,
-                    requestBody: { ...eventResource, id: newGoogleEventId },
+                    requestBody: eventResource,
                     customOperationId: modeusEventId,
-                    originalGoogleId: newGoogleEventId,
+                    originalGoogleId: null, // Will be filled with response ID
                 });
             }
         }
@@ -511,7 +510,7 @@ class GoogleCalendarService {
                 // Success - save to database
                 const eventTimestamp = Math.floor(Date.now() / 1000);
                 dbUpdates.push({
-                    uniqueId: `${modeusEventId}-${userId}`,
+                    uniqueId: `${userId};${modeusEventId}`,
                     calendarId: response.id,
                     timestamp: Math.floor(Date.now() / 1000),
                     eventTimestamp: eventTimestamp
@@ -523,10 +522,19 @@ class GoogleCalendarService {
 
         // Batch update database
         if (dbUpdates.length > 0) {
-            const updatePromises = dbUpdates.map(update => 
-                this.database.saveCalendarEvent(update.uniqueId, update.calendarId, update.timestamp, update.eventTimestamp)
-            );
-            await Promise.allSettled(updatePromises);
+            logger.info(`User ${userId}: Saving ${dbUpdates.length} calendar events to database`);
+            const updatePromises = dbUpdates.map(update => {
+                logger.info(`Saving calendar event: ${update.uniqueId} -> ${update.calendarId}`);
+                return this.database.saveCalendarEvent(update.uniqueId, update.calendarId, update.timestamp, update.eventTimestamp);
+            });
+            const results = await Promise.allSettled(updatePromises);
+            
+            const failures = results.filter(result => result.status === 'rejected');
+            if (failures.length > 0) {
+                logger.error(`User ${userId}: ${failures.length} database saves failed`, failures.map(f => f.reason));
+            } else {
+                logger.success(`User ${userId}: All ${dbUpdates.length} calendar events saved successfully`);
+            }
         }
     }
 

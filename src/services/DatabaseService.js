@@ -17,7 +17,7 @@ class DatabaseService {
     async initialize() {
         try {
             const dbConfig = config.get('database');
-            
+
             this.pool = mysql.createPool({
                 host: dbConfig.hostname,
                 port: dbConfig.port,
@@ -49,7 +49,7 @@ class DatabaseService {
      */
     async testConnection() {
         if (!this.pool) throw new Error("Pool not initialized");
-        
+
         const connection = await this.pool.getConnection();
         try {
             await connection.ping();
@@ -73,12 +73,12 @@ class DatabaseService {
                 return results;
             } catch (error) {
                 logger.warn(`Query attempt ${attempt} failed: ${error.message}`);
-                
+
                 if (attempt === retries) {
                     logger.error(`Query failed after ${retries} attempts`, error);
                     throw error;
                 }
-                
+
                 // Wait before retry
                 await this.delay(1000 * attempt);
             }
@@ -92,13 +92,13 @@ class DatabaseService {
         const connection = await this.pool.getConnection();
         try {
             await connection.beginTransaction();
-            
+
             const results = [];
             for (const { sql, params } of queries) {
                 const [result] = await connection.execute(sql, params || []);
                 results.push(result);
             }
-            
+
             await connection.commit();
             return results;
         } catch (error) {
@@ -231,11 +231,14 @@ class DatabaseService {
     }
 
     // Calendar event methods
-    async saveCalendarEvent(modeusId, calendarId, timestamp) {
-        await this.query(
-            "INSERT INTO calendar_events (`modeus_id`, `calendar_id`, `timestamp`) VALUES(?, ?, ?) ON DUPLICATE KEY UPDATE `calendar_id`=?, `timestamp`=?",
-            [modeusId, calendarId, timestamp, calendarId, timestamp]
-        );
+    async saveCalendarEvent(modeusId, calendarId, timestamp, eventTimestamp) {
+        if (!eventTimestamp) {
+            throw "No event timestamp.";
+        }
+        const insertValues = [modeusId, calendarId, timestamp, eventTimestamp];
+        const insertQuery = "INSERT INTO calendar_events (`modeus_id`, `calendar_id`, `timestamp`, `event_timestamp`) VALUES(?, ?, ?, ?) ON DUPLICATE KEY UPDATE `calendar_id`=?, `timestamp`=?, `event_timestamp`=?";
+        const updateValues = [...insertValues, calendarId, timestamp, eventTimestamp];
+        await this.query(insertQuery, updateValues);
     }
 
     async findCalendarEvent(modeusId) {
@@ -263,7 +266,7 @@ class DatabaseService {
             "DELETE FROM events WHERE `timestamp` < ? AND `last_update` != ?",
             [mondayTimestamp, lastUpdate]
         );
-        
+
         const affectedRows = result && result.affectedRows ? result.affectedRows : 0;
         logger.info(`Cleaned up ${affectedRows} old events`);
     }
@@ -273,7 +276,7 @@ class DatabaseService {
             "DELETE FROM student_events WHERE `timestamp` < ? AND `last_update` != ?",
             [mondayTimestamp, lastUpdate]
         );
-        
+
         const affectedRows = result && result.affectedRows ? result.affectedRows : 0;
         logger.info(`Cleaned up ${affectedRows} old student events`);
     }

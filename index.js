@@ -46,7 +46,7 @@ function getDates() {
     let diff = (timestamp - first_monday) % (7 * 24 * 60 * 60 * 1000);
 
     let start_timestamp = timestamp - diff - 5 * 60 * 60 * 1000;
-    let end_timestamp = start_timestamp + 3 * 7 * 24 * 60 * 60 * 1000;
+    let end_timestamp = start_timestamp + 8 * 7 * 24 * 60 * 60 * 1000;
 
     let sd = new Date(start_timestamp);
     let ed = new Date(end_timestamp);
